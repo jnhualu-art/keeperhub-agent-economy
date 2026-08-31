@@ -1,0 +1,5 @@
+# KeeperHub Agent Economy — 依赖
+# 核心 (health_factor + executor) 仅用标准库即可运行 dry_run
+# 以下为完整舰队 (grid/yield/rebalancing) 所需
+web3>=6.0.0
+httpx>=0.27.0

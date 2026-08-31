@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 密钥 / 环境
+.env
+.env.local
+
+# 缓存
+.cache_*.json
+
+# 日志 (audit 含 tx hash, 不提交但本地保留)
+logs/
