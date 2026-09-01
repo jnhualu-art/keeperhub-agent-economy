@@ -27,6 +27,23 @@
 - 每次执行带 `idempotency_key` 防重复上链
 - 全量审计落 `logs/audit.jsonl`（含 tx hash 或跳过原因）
 
+## ✅ 已验证真上链（Live On-Chain Proof）
+
+本项目不是 demo 稿——`HealthFactorAgent → Executor → KeeperHub MCP → Aave V3 Sepolia`
+整条链路已在测试网 **真实执行过一次完整兜底**，全部动作可链上核验：
+
+**场景**：监控钱包 `0x1573C3d151200922375bC48012BB1f232B2cF531` 在 Aave V3 (Sepolia) 的仓位
+
+| 阶段 | 动作 | 健康因子 HF | 链上证明 |
+|---|---|---|---|
+| ① 制造危险 | 经 KeeperHub 多借 27 USDC | 1.5668 → **1.2471** (WARN) | [`0x3985c67d…79587`](https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587) |
+| ② agent 决策 | `HealthFactorAgent` 读 HF=1.2471 → 判定 WARN → 产出 PROTECT（还 13.23 USDC） | — | 审计 `logs/audit.jsonl` |
+| ③ 自动兜底 | `Executor` 路由 `aave-v3/repay` 真上链 | **1.2471 → 1.3856** (恢复) | [`0x5c32bc4c…759e9`](https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9) |
+
+- 两笔交易均为 `sponsored: true`（gas 由 KeeperHub relay 代付，钱包无需持有 ETH）
+- 全程 **零托管私钥**：KeeperHub 用其 Turnkey 钱包代签，agent 代码只持有 API Key
+- 复现命令：`DRY_RUN=false python src/main.py`（需 `.env` 填 `KEEPERHUB_API_KEY` + `MONITOR_ADDRESS`）
+
 ## 双赛道策略（建议交两个独立 BUIDL）
 
 1. **Best Integration ($4k 主赛道)** — 本项目本体：4 agent + KeeperHub 执行层

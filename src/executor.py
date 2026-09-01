@@ -149,6 +149,7 @@ class Executor:
                     "network": os.getenv("CHAIN_ID", "11155111"),
                     "asset": token_addr(asset),
                     "amount": amount_base,
+                    "interestRateMode": "2",
                     "onBehalfOf": os.getenv("WALLET_ADDRESS", ""),
                 },
             }
@@ -160,6 +161,7 @@ class Executor:
             res = self.client.repay(
                 asset=token_addr(asset),
                 amount=amount_base,
+                interest_rate_mode="2",  # Aave V3 浮动利率 (KeeperHub 必填字段)
                 idempotency_key=f"protect-{int(time.time())}",
             )
             tx = res.get("transactionHash") or res.get("result", {}).get("transactionHash")
