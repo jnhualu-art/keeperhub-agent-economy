@@ -1,94 +1,131 @@
-# KeeperHub Agent Economy — 整合提交物
+# KeeperHub as a Conditional Execution Layer for DeFi Position Management
 
-> KeeperHub 第二轮「The Agent Economy Hackathon」(DoraHacks) 整合项目
-> 把 D 盘两个已验证项目 **组合成一个更强的提交物**:
-> - `rebalance-keeper`（第一轮 KeeperHub 代码，含**已验证真上链**的 KeeperHub MCP 执行层）
-> - `bnb-build-the-era`（BNB Agent Studio 四大金融决策 agent，**真实链上读 + 真实风控**）
+> **Hackathon**: KeeperHub — The Agent Economy Hackathon (DoraHacks, Season 2)
+> **Track**: Best Integration
+> **Demo video**: https://youtu.be/C48UpGSQJLQ
+> **Live proof**: two sponsored transactions on Aave V3 (Sepolia), see [below](#live-on-chain-proof)
 
-## 为什么这个提交物"更强"
+---
 
-第一轮 KeeperHub 只做了"一个 agent（RebalanceKeeper）发一个 Aave V3 交易"。
-这一轮把 **4 类金融决策智能** 接到 **同一个真上链执行层** 上，形成一个完整的 Agent 经济闭环:
+## The use case
 
-| Agent | 链上读 | 决策 | KeeperHub 执行 |
+KeeperHub is usually described as *"execute and sponsor transactions from an agent."* This project asks a different question:
+
+> **What if KeeperHub were the execution backend for agents that watch a position and act only when a condition breaks?**
+
+That turns KeeperHub from a transaction relay into a **conditional execution layer** — the missing half of any automated DeFi risk system. You can read chain state with an RPC for free; you cannot *react* on-chain without a signing path. KeeperHub is that path, and it removes the two things that normally block it: **custody** (Turnkey signs, your agent never holds a key) and **gas** (transactions are sponsored, the monitored wallet needs zero ETH).
+
+The concrete use case demonstrated here: **a lending position that defends itself from liquidation without its owner being online.**
+
+```
+Aave V3 health factor drops below threshold
+      │
+      ▼
+HealthFactorAgent reads getUserAccountData()  ──►  classifies SAFE / WARN / DANGER / CRITICAL
+      │                                             computes the exact repay amount
+      ▼
+Executor resolves action ──► KeeperHub MCP ──► Turnkey wallet signs
+      │                                             (gas sponsored)
+      ▼
+aave-v3/repay broadcast on-chain  ──►  health factor recovers  ──►  audit.jsonl
+```
+
+This is the "self-healing position" pattern. It is not specific to Aave — swap the condition, and the same Executor + KeeperHub path serves LP rebalancing, yield migration, and grid market-making.
+
+## Why this matters for KeeperHub's users
+
+Three properties make this pattern a customer-acquisition story, not just a demo:
+
+| Property | What it unlocks |
+|---|---|
+| **The monitored wallet needs no ETH** | A retail user can point a guardian agent at their existing Aave position and walk away. No funding step, no gas onboarding — this is what makes it viable for *many individuals and small businesses*, not just crypto-native power users. |
+| **Zero custody** | An agent holding an API key can move funds, but the private key never leaves Turnkey's HSM. This is the objection every enterprise risk team raises first, and KeeperHub already answers it. |
+| **Every action is auditable** | `logs/audit.jsonl` records each decision, each skip, and the reason. Compliance teams can replay the agent's entire decision history. |
+
+## Trustlessness
+
+Two independent guarantees, neither of which depends on trusting this codebase:
+
+1. **Non-custodial signing** — the agent holds only an API key. Signing happens inside KeeperHub's Turnkey wallet. This code cannot exfiltrate a private key because it never has one.
+2. **Fail-closed execution** — `dry_run` defaults to `true`. With no API key or no wallet configured, the fleet refuses to broadcast anything. Every execution carries an `idempotency_key`, so a retry after a network failure cannot double-spend.
+
+The second one matters because a "guardian" that misfires is worse than no guardian. See [Safety](#safety-design).
+
+## Live on-chain proof
+
+This is not a plan-only demo. The full path `HealthFactorAgent → Executor → KeeperHub MCP → Aave V3 Sepolia` executed a complete defensive cycle on testnet. Both transactions are publicly verifiable.
+
+**Monitored wallet**: `0x1573C3d151200922375bC48012BB1f232B2cF531`
+
+| Stage | Action | Health factor | On-chain proof |
 |---|---|---|---|
-| **HealthFactor** (`hfsentinel.agent`) | Aave V3 账户数据 | 健康因子分级 (SAFE/WARN/DANGER/CRITICAL) + 计算还款额 | `aave-v3/repay` **真上链还债** ✅ 已验证 |
-| **Rebalancing** (`rangeguard.agent`) | PancakeSwap V3 仓位 tick + pool slot0 | 检测脱区间 / 近边界，算新区间 | `execute_contract_call` 再平衡 plan |
-| **Yield** (`yieldpilot.agent`) | DefiLlama BSC 池 APY/TVL | 风险调整评分，提升>15% 才迁移 | `execute_contract_call` 迁移 plan |
-| **Grid** (`silent-martin.agent`) | BSC DEX 价格 + CEX 背离 + ATR | 链上锚定报价 + 库存偏斜 + kill-switch | DEX 网格报价 plan |
+| ① Create the danger | Borrow 27 USDC through KeeperHub | 1.5668 → **1.2471** (WARN) | [`0x3985c67d…79587`](https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587) |
+| ② Agent decides | Reads HF = 1.2471 → WARN → emits PROTECT (repay 13.23 USDC) | — | `logs/audit.jsonl` |
+| ③ Self-heal | Executor routes `aave-v3/repay`, broadcast via KeeperHub | **1.2471 → 1.3856** (recovered) | [`0x5c32bc4c…759e9`](https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9) |
 
-**核心卖点（评审最看重）**：`HealthFactorAgent` 的 `PROTECT` action 经 `Executor`
-路由到 KeeperHub `aave-v3/repay`，在 Aave V3 (Sepolia) 上 **真的发还款交易**——
-不是模拟，不是假 tx。其余三类决策同样走同一执行层，生成可一键点火的合约调用 plan。
+Both transactions are `sponsored: true`. Reproduce with `DRY_RUN=false python src/main.py`.
 
-安全设计：
-- `dry_run` 默认开启，无 API Key / 无 wallet 时 **绝不** 真发交易
-- 硬 kill-switch（回撤/数据陈旧/连续异常停机）
-- 每次执行带 `idempotency_key` 防重复上链
-- 全量审计落 `logs/audit.jsonl`（含 tx hash 或跳过原因）
+## The fleet
 
-## ✅ 已验证真上链（Live On-Chain Proof）
+Four decision agents share one execution layer and one audit pipeline. Each reads real on-chain state; each emits an action that the Executor resolves against KeeperHub.
 
-本项目不是 demo 稿——`HealthFactorAgent → Executor → KeeperHub MCP → Aave V3 Sepolia`
-整条链路已在测试网 **真实执行过一次完整兜底**，全部动作可链上核验：
-
-**场景**：监控钱包 `0x1573C3d151200922375bC48012BB1f232B2cF531` 在 Aave V3 (Sepolia) 的仓位
-
-| 阶段 | 动作 | 健康因子 HF | 链上证明 |
+| Agent | Reads | Decides | KeeperHub action |
 |---|---|---|---|
-| ① 制造危险 | 经 KeeperHub 多借 27 USDC | 1.5668 → **1.2471** (WARN) | [`0x3985c67d…79587`](https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587) |
-| ② agent 决策 | `HealthFactorAgent` 读 HF=1.2471 → 判定 WARN → 产出 PROTECT（还 13.23 USDC） | — | 审计 `logs/audit.jsonl` |
-| ③ 自动兜底 | `Executor` 路由 `aave-v3/repay` 真上链 | **1.2471 → 1.3856** (恢复) | [`0x5c32bc4c…759e9`](https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9) |
+| **HealthFactor** (`hfsentinel.agent`) | Aave V3 `getUserAccountData` | HF tiering (SAFE/WARN/DANGER/CRITICAL) + exact repay sizing | `aave-v3/repay` — **executed on-chain** ✅ |
+| **Rebalancing** (`rangeguard.agent`) | PancakeSwap V3 position ticks + pool `slot0` | Out-of-range / near-boundary detection, new range | `execute_contract_call` plan |
+| **Yield** (`yieldpilot.agent`) | DefiLlama BSC pool APY / TVL | Risk-adjusted score, migrate only if uplift > 15% | `execute_contract_call` plan |
+| **Grid** (`silent-martin.agent`) | BSC DEX price + CEX divergence + ATR | Chain-anchored quoting + inventory skew + kill-switch | DEX grid quoting plan |
 
-- 两笔交易均为 `sponsored: true`（gas 由 KeeperHub relay 代付，钱包无需持有 ETH）
-- 全程 **零托管私钥**：KeeperHub 用其 Turnkey 钱包代签，agent 代码只持有 API Key
-- 复现命令：`DRY_RUN=false python src/main.py`（需 `.env` 填 `KEEPERHUB_API_KEY` + `MONITOR_ADDRESS`）
+**Only HealthFactor has executed on testnet.** The other three produce fully-formed, ready-to-fire call plans but run `dry_run: true` — they read live chain data and make real decisions, but do not broadcast. This is stated plainly rather than papered over: one verified execution path proves the integration; the other three prove the pattern generalizes.
 
-## 双赛道策略（建议交两个独立 BUIDL）
+## Safety design
 
-1. **Best Integration ($4k 主赛道)** — 本项目本体：4 agent + KeeperHub 执行层
-2. **Best Feature ($1k bounty)** — 单独突出 `Executor` 的 **条件执行 + 审计风控** 模块，
-   或 `HealthFactorAgent` 的 **防清算自动还款** 特性
+- `dry_run` defaults on — no API key or no wallet means **no broadcast, ever**
+- Hard kill-switch: drawdown limits, stale-data detection, consecutive-failure halts
+- `idempotency_key` on every execution, so retries cannot double-spend
+- Full audit trail in `logs/audit.jsonl` (tx hash, or the reason for skipping)
 
-两个 BUIDL 共用同一仓库，提交时各自指向不同 README 章节 / demo 视频即可叠加获奖。
-
-## 目录结构
+## Repository layout
 
 ```
 keeperhub-agent-economy/
 ├── src/
-│   ├── base_agent.py          # 四大 agent 共享基类 + ERC-8004 注册
-│   ├── config.py              # Aave V3 / KeeperHub / Token 常量
-│   ├── keeperhub_client.py    # KeeperHub MCP HTTP 客户端 (真上链执行层)
-│   ├── executor.py            # 整合层: action -> KeeperHub 路由 + 审计 (本文件核心)
-│   ├── health_factor_agent.py # Aave V3 防清算 (旗舰, 真上链 repay)
-│   ├── rebalancing_agent.py   # PancakeSwap V3 LP 再平衡
-│   ├── yield_agent.py         # BSC 收益路由
-│   ├── grid_agent.py          # BSC 网格做市 (silent-martin 移植)
-│   └── main.py                # 舰队编排入口
+│   ├── base_agent.py          # shared agent base + ERC-8004 registration
+│   ├── config.py              # Aave V3 / KeeperHub / token constants
+│   ├── keeperhub_client.py    # KeeperHub MCP HTTP client (execution layer)
+│   ├── executor.py            # integration core: action → KeeperHub routing + audit
+│   ├── health_factor_agent.py # Aave V3 liquidation defense (flagship, live repay)
+│   ├── rebalancing_agent.py   # PancakeSwap V3 LP rebalancing
+│   ├── yield_agent.py         # BSC yield routing
+│   ├── grid_agent.py          # BSC grid market-making
+│   └── main.py                # fleet orchestration entrypoint
+├── scripts/
+│   ├── setup_aave_position_web3.py   # seed a test position to reproduce the demo
+│   └── test_keeperhub_connection.py  # MCP connectivity smoke test
+├── logs/audit.jsonl           # execution audit trail (gitignored, reproducible)
 ├── .env.example
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
 
-## 本地运行
+## Running it
 
 ```bash
-# 1) 建 venv (D 盘, 不污染 C)
+# 1) venv
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 
-# 2) dry_run demo (不需要 Key, 不真发交易)
+# 2) dry run — no API key needed, never broadcasts
 set DRY_RUN=true
 .\.venv\Scripts\python src/main.py
 
-# 3) 真上链 (需 KeeperHub API Key + 已开通的钱包)
-#    复制 .env.example -> .env 并填 KEEPERHUB_API_KEY / WALLET_ADDRESS
+# 3) live — requires KeeperHub API key + provisioned wallet
+#    copy .env.example -> .env, fill KEEPERHUB_API_KEY / MONITOR_ADDRESS
 set DRY_RUN=false
 .\.venv\Scripts\python src/main.py
 ```
 
-dry_run 输出示例：
+Dry-run output:
+
 ```
 KEEPERHUB AGENT ECONOMY — FLEET REPORT
 dry_run            : True
@@ -103,16 +140,26 @@ skipped            : 0
 [      Grid]       ok  actions=1  ...
 ```
 
-## 注册参赛（KeeperHub 第二轮）
+## Submission status
 
-赛事页: https://dorahacks.io/hackathon/agent-economy/detail
+- **Register as Hacker** — open until the 18 Sep deadline; registration and submission are separate actions
+- **Submit BUIDL** — opens **6 Sep 12:00 CEST**
+- **Deadline** — **18 Sep 12:00 CEST** (18:00 Beijing)
+- Event page: https://dorahacks.io/hackathon/agent-economy/detail
 
-1. 用 GitHub 登录 DoraHacks → 点 **Register as Hacker**
-2. 等待 **Pre-registration 开放**（约 9/1 前后，6 天后）
-3. **9/6 12:00 CEST** 起开放 **Submit BUIDL** → 交本项目
-   - 主赛道 Best Integration ($4k)：贴仓库 + demo 视频（HealthFactor 真还债那段）
-   - bounty Best Feature ($1k)：单独突出 Executor / 防清算特性
-4. **Deadline: 9/18** — 在此之前可改 BUIDL
+> The **Best Feature bounty** is judged as *"a pull request to the KeeperHub repository — can we merge it and build on it?"*. It is therefore tracked separately from this repo and is not claimed by this submission.
 
-> 注意：Submission 9/6 才开，现在先把代码跑通 + 录好 demo 视频 + 准备仓库。
+## Links
+
 ```
+Repo      : https://github.com/jnhualu-art/keeperhub-agent-economy
+Demo      : https://youtu.be/C48UpGSQJLQ
+Hackathon : https://dorahacks.io/hackathon/agent-economy/detail
+Wallet    : 0x1573C3d151200922375bC48012BB1f232B2cF531
+```
+
+## Author
+
+Solo — 陆俊华 ([@Jhhu73965779](https://x.com/Jhhu73965779))
+
+MIT licensed.
