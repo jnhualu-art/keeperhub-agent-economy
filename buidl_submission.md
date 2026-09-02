@@ -170,6 +170,7 @@ Repay TX  : https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849
 
 - [ ] 让 Rebalancing / Yield / Grid 中**至少 1 个**也真跑一笔链上交易
       （目前只有 HealthFactor 真上链，"4 agent 舰队"卖点打折）
-- [ ] 补单元测试（bounty rubric 第 3 条要看 tests，主赛道也看 code quality）
+- [x] 补单元测试（48 个全绿：executor 风控/审计、kill-switch、HF 分级与还款额、
+      interestRateMode 防回归、Sepolia 实盘场景回归；2026-09-02 完成）
 - [ ] 用 OpenZeppelin Defender Monitor 给 KeeperHub 执行回执加一层监控告警
       （对上 jacob 提的 trustlessness 方向，且不需要改 KeeperHub 源码）

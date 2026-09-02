@@ -140,6 +140,24 @@ skipped            : 0
 [      Grid]       ok  actions=1  ...
 ```
 
+## Tests
+
+The safety guarantees above are enforced by a test suite (48 tests, no network access — every on-chain interaction is faked):
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+Coverage highlights:
+
+| Suite | What it pins down |
+|---|---|
+| `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail |
+| `test_base_agent.py` | all three kill-switches (drawdown / stale data / consecutive errors), halt semantics, ERC-8004 registration file shape |
+| `test_health_factor_agent.py` | Aave base-unit normalization (incl. `2^256-1` → `inf` for no-debt), SAFE/WARN/CRITICAL thresholds, repay sizing per tier, plus a regression test replaying the real Sepolia incident (HF 1.2471 → repay 13.23 USDC) |
+| `test_keeperhub_client.py` | amount→base-unit conversion, `interestRateMode` required-field regression, idempotency-key attempt suffixing, retry exhaustion, error normalization to `MCPError` |
+
 ## Submission status
 
 - **Register as Hacker** — open until the 18 Sep deadline; registration and submission are separate actions
