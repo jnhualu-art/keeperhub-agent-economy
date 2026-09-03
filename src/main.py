@@ -179,6 +179,21 @@ def run_fleet(fleet: List[Tuple[str, BaseAgent]]) -> Tuple[List[Dict], List[Dict
                 report["metrics"] = snap.get("metrics", {})
                 report["actions"] = snap.get("actions", [])
                 report["notes"] = snap.get("notes", "")
+                # 同步 agent 的真实状态。status 默认 "ok", 若不从快照里取,
+                # 一个已经熔断停机的 agent 会在报告和 fleet_status.json 里
+                # 持续显示为健康 —— 对一个安全项目来说, 谎报健康比报错更糟。
+                agent_status = snap.get("status")
+                if snap.get("kill_switch_active") or agent_status == "halted":
+                    report["status"] = "halted"
+                    if not report["notes"]:
+                        report["notes"] = "HALTED: kill-switch active"
+                elif agent_status and agent_status != "running":
+                    report["status"] = agent_status
+            elif getattr(agent.state, "kill_switch_active", False):
+                # 停机发生在第一轮, 快照还没落进 history, 但状态已经是 halted
+                report["status"] = "halted"
+                report["notes"] = agent.state.notes or "HALTED: kill-switch active"
+
             for a in report["actions"]:
                 a.setdefault("source_agent", name)
                 all_actions.append(a)
