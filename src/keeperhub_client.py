@@ -10,12 +10,15 @@ Session IDs are valid for 24 hours and cached in-memory.
 """
 
 import json
+import logging
 import time
 import urllib.request
 import urllib.error
 from typing import Any, Dict, Optional
 
 import config  # 平铺结构: 同级模块导入 (绑定 config 模块名供下方 config.X 引用)
+
+logger = logging.getLogger(__name__)
 
 
 class MCPError(Exception):
@@ -55,8 +58,14 @@ class KeeperHubClient:
         method: str,
         params: Dict[str, Any],
         msg_id: Optional[int] = None,
+        _session_retry: bool = False,
     ) -> Optional[Dict]:
-        """Send one MCP JSON-RPC message. Auto-manages session."""
+        """Send one MCP JSON-RPC message. Auto-manages session.
+
+        :param _session_retry: 内部用。标识这次调用已经是"重建会话后的重试",
+            用于给会话过期重试设上限 —— 原实现会无条件重试, 会话一旦持续
+            失效就会无限递归到 RecursionError。
+        """
         # Ensure we have a valid session
         if method not in ("initialize", "notifications/initialized"):
             self._ensure_session()
@@ -90,11 +99,18 @@ class KeeperHubClient:
                 return json.loads(body)
         except urllib.error.HTTPError as e:
             body = e.read().decode()
-            # If session expired, reset and retry once
-            if e.code in (400, 401) and "session" in body.lower():
+            # If session expired, reset and retry — at most once.
+            # 无限重试看起来"更健壮", 实际会在会话持续失效时把调用栈打爆,
+            # 而且重试本身也可能重复提交一笔写操作。
+            if (
+                e.code in (400, 401)
+                and "session" in body.lower()
+                and not _session_retry
+                and msg_id is not None
+            ):
                 self._session_id = None
-                if msg_id is not None:
-                    return self._send(method, params, msg_id)
+                logger.warning("MCP session 失效, 重建后重试一次 (method=%s)", method)
+                return self._send(method, params, msg_id, _session_retry=True)
             raise MCPError(f"HTTP {e.code}: {body[:500]}") from e
 
     def _ensure_session(self):
@@ -190,15 +206,40 @@ class KeeperHubClient:
                 return info.get("decimals", 18)
         return 18
 
-    def _to_base(self, amount: str, decimals: int = 18) -> str:
-        """Convert human-readable amount to token's smallest unit."""
+    @staticmethod
+    def _to_base(amount: str, decimals: int = 18, amount_is_base: bool = False) -> str:
+        """Convert human-readable amount to token's smallest unit.
+
+        原实现有两个问题, 审计时都会被挑出来:
+
+        1. `int(val * 10**decimals)` 用二进制浮点做金融换算且直接截断。
+           13.23 * 1e6 = 13229999.999999998 -> 13229999, 凭空少 1 base unit。
+           实测 0.01~2000.00 USD 里约 1.2% 的金额会踩中。
+        2. `if val < 100` 这个魔法阈值把"人类可读"和"已是 base unit"两种
+           语义混在一个参数里: 传 "13.23" 被当成人可读, 传 "13230000" 被
+           当成 base unit 原样返回 —— 靠数值大小猜语义, 迟早出事。
+
+        现在用 Decimal 精确换算, 并允许调用方显式声明语义 (amount_is_base)。
+        未声明时退回启发式: 含小数点视为人类可读, 纯整数视为已是 base unit
+        —— 这条兼容路径只为不破坏既有脚本, 新代码应当显式传 amount_is_base。
+        """
+        from decimal import Decimal, InvalidOperation
+
+        s = str(amount).strip()
         try:
-            val = float(amount)
-            if val < 100:
-                return str(int(val * (10 ** decimals)))
-        except ValueError:
-            pass
-        return amount
+            d = Decimal(s)
+        except (InvalidOperation, ValueError):
+            logger.warning("_to_base: 无法解析 amount=%r, 原样透传", amount)
+            return s
+
+        if amount_is_base:
+            return str(int(d))
+
+        if "." in s:
+            return str(int(d * (10 ** decimals)))
+
+        # 兼容路径: 纯整数视为已经是 base unit
+        return s
 
     def supply(
         self,
@@ -207,12 +248,17 @@ class KeeperHubClient:
         on_behalf_of: str = None,
         network: str = None,
         idempotency_key: str = None,
+        amount_is_base: bool = False,
     ) -> Dict:
-        """Supply an asset as collateral to Aave V3."""
+        """Supply an asset as collateral to Aave V3.
+
+        :param amount_is_base: True 表示 amount 已是最小单位, 不再换算。
+            调用方**知道**自己传的是什么语义时就该显式声明, 别让库去猜。
+        """
         params: Dict[str, Any] = {
             "network": network or config.CHAIN_ID,
             "asset": asset,
-            "amount": self._to_base(amount, self._decimals_for(asset)),
+            "amount": self._to_base(amount, self._decimals_for(asset), amount_is_base),
             "onBehalfOf": on_behalf_of or config.WALLET_ADDRESS,
             "referralCode": "0",
         }
@@ -226,12 +272,13 @@ class KeeperHubClient:
         interest_rate_mode: str = None,
         network: str = None,
         idempotency_key: str = None,
+        amount_is_base: bool = False,
     ) -> Dict:
         """Borrow an asset from Aave V3 against supplied collateral."""
         params: Dict[str, Any] = {
             "network": network or config.CHAIN_ID,
             "asset": asset,
-            "amount": self._to_base(amount, self._decimals_for(asset)),
+            "amount": self._to_base(amount, self._decimals_for(asset), amount_is_base),
             "onBehalfOf": on_behalf_of or config.WALLET_ADDRESS,
             "referralCode": "0",
         }
@@ -247,12 +294,13 @@ class KeeperHubClient:
         interest_rate_mode: str = None,
         network: str = None,
         idempotency_key: str = None,
+        amount_is_base: bool = False,
     ) -> Dict:
         """Repay borrowed asset to Aave V3."""
         params: Dict[str, Any] = {
             "network": network or config.CHAIN_ID,
             "asset": asset,
-            "amount": self._to_base(amount, self._decimals_for(asset)),
+            "amount": self._to_base(amount, self._decimals_for(asset), amount_is_base),
             "onBehalfOf": on_behalf_of or config.WALLET_ADDRESS,
             "referralCode": "0",
         }

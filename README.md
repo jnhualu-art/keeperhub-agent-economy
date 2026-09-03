@@ -147,6 +147,30 @@ HealthFactor and CapitalEfficiency are deliberately paired: they manage the *sam
 - `idempotency_key` on every execution, so retries cannot double-spend
 - Full audit trail in `logs/audit.jsonl` (tx hash, or the reason for skipping)
 
+## Security notes
+
+An agent that claims to protect funds has to survive being audited itself, so
+the executor layer was reviewed against a hostile-upstream threat model:
+*what happens when a decision agent emits a malformed, contradictory, or
+outright oversized action?* Every finding below was real, reproduced with a
+script rather than reasoned about, and fixed. `scripts/audit_probe.py` reruns
+the whole set and prints pass/fail per item.
+
+| Finding | Why it mattered | Status |
+|---|---|---|
+| Hard cap bypassable | The cap was checked against `amount_usd`, which defaults to `0.0`. An upstream action carrying only `amount_base` sailed straight through — a probe put ~1B USDC of base units on the wire. | Fixed: amounts are normalised from `amount_base`, and `amount_usd`/`amount_base` are cross-checked against each other |
+| Idempotency key was a timestamp | `f"protect-{int(time.time())}"` produces a *different* key for a retry one second later, so KeeperHub treats it as a new transaction. The docstring claimed protection that did not exist. | Fixed: key is derived from action content plus a time bucket |
+| Floating-point amount conversion | `int(13.23 * 10**6)` is `13229999`, not `13230000` — IEEE754 rounding, and it silently truncates. About **1.2%** of amounts in 0.01–2000.00 USD lose 1 base unit. | Fixed: `Decimal` throughout |
+| Audit written after broadcast | If the process died between sending the transaction and writing the audit line, the chain would hold a transaction the reconciler could never see. | Fixed: write-ahead intent record; when the audit log is unwritable, **zero transactions are sent** |
+| No liquidation floor | The executor would forward a borrow whose declared post-trade health factor was below 1.0. | Fixed: `hf_after` below 1.0 is refused |
+| Unbounded session retry | A persistently invalid MCP session recursed until `RecursionError`. | Fixed: one retry, then error |
+
+Two things that were checked and are **not** problems, recorded so they don't
+get re-litigated: no private keys or secrets are in the repository or its
+history (`.env` has never been committed), and the kill-switch genuinely
+prevents actions from reaching the executor — a probe confirmed that a halting
+agent contributes zero actions.
+
 ## Repository layout
 
 ```
@@ -223,7 +247,7 @@ skipped            : 0
 
 ## Tests
 
-The safety guarantees above are enforced by a test suite (149 tests, no network access — every on-chain interaction is faked):
+The safety guarantees above are enforced by a test suite (181 tests, no network access — every on-chain interaction is faked):
 
 ```bash
 pip install pytest
@@ -241,6 +265,7 @@ Coverage highlights:
 | `test_alert_receiver.py` | HMAC signature accepted, wrong secret / tampered payload / stale timestamp rejected, replay window, non-object payload rejected, and a rejected webhook writing nothing to disk |
 | `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail, `REBALANCE` venue dispatch, executor-side hard cap blocking oversized borrows |
 | `test_capital_efficiency_agent.py` | the risk model that sizes every borrow: `max_debt = collateral × threshold / HF_target`, safety discount, on-chain cap clamping, negative-headroom clamping, graceful degradation on MCP error / malformed data, and the hand-off boundary where the agent defers to HealthFactor |
+| `test_executor_safety.py` | the "executor never trusts upstream" invariants: hard cap cannot be bypassed by omitting `amount_usd`, a borrow declaring `hf_after < 1.0` is refused, contradictory `amount_usd`/`amount_base` is rejected, idempotency keys are content-derived, and **write-ahead auditing means zero transactions are sent when the audit log is unwritable** |
 | `test_test_isolation.py` | meta-tests: the suite cannot see real credentials, and `KeeperHubClient`'s bound default `api_key` is empty. Guards against a bug where `scripts/test_keeperhub_connection.py` matched pytest's `test_*.py` pattern, got imported during collection, and loaded `.env` before `src.config` snapshotted the real API key — so single-file runs passed while full runs failed *and ran holding live credentials* |
 | `test_base_agent.py` | all three kill-switches (drawdown / stale data / consecutive errors), halt semantics, ERC-8004 registration file shape |
 | `test_health_factor_agent.py` | Aave base-unit normalization (incl. `2^256-1` → `inf` for no-debt), SAFE/WARN/CRITICAL thresholds, repay sizing per tier, plus a regression test replaying the real Sepolia incident (HF 1.2471 → repay 13.23 USDC) |
