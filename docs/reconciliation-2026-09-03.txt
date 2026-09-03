@@ -1,0 +1,29 @@
+独立节点: https://1rpc.io/sepolia
+链头高度: 11624568
+
+==============================================================================
+INDEPENDENT RECONCILIATION — KeeperHub's claims vs third-party chain data
+==============================================================================
+
+[OK  ] 0x5c32bc4c9094…  PROTECT    13.23 -> 13.230000 USDC  (Repay->Repay)
+  + receipt_available: found on independent node
+  + tx_success: status=1
+  + execution_topology: from=0x809d8252aa… to=0x5af5194b4b… — relayed, gas sponsored by KeeperHub; ownership is proven by the Pool event below, not tx fields
+  + event_emitted: Pool emitted Repay
+  + event_matches_action: PROTECT -> Repay
+  + wallet_matches: event subject = 0x1573c3d151…
+  + amount_matches: claimed 13.23 vs on-chain 13.230000 (delta 0.000000 <= 0.1323)
+
+[OK  ] 0x0a565f54e189…  REBALANCE  6.69 -> 6.690000 USDC  (Borrow->Borrow)
+  + receipt_available: found on independent node
+  + tx_success: status=1
+  + execution_topology: from=0x809d8252aa… to=0x5af5194b4b… — relayed, gas sponsored by KeeperHub; ownership is proven by the Pool event below, not tx fields
+  + event_emitted: Pool emitted Borrow
+  + event_matches_action: REBALANCE -> Borrow
+  + wallet_matches: event subject = 0x1573c3d151…
+  + amount_matches: claimed 6.69 vs on-chain 6.690000 (delta 0.000000 <= 0.0669)
+
+------------------------------------------------------------------------------
+2/2 claims independently verified
+Every execution KeeperHub reported is confirmed by an unrelated node: same transaction, same event, same amount.
+

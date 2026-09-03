@@ -6,3 +6,9 @@ httpx>=0.27.0
 
 # 测试 (python -m pytest tests/)
 pytest>=8.0.0
+
+# 可选: 独立对账用的 keccak 后端。
+# src/evm.py 会依次尝试 eth-utils / pycryptodome, 都没有时回退到内置的
+# Aave 事件 topic0 常量表 —— 因此不装也能跑 scripts/run_reconcile.py,
+# 只是无法计算常量表之外的事件签名。
+pycryptodome>=3.20.0

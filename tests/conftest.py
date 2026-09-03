@@ -26,13 +26,20 @@ def _clean_env(monkeypatch):
         "WALLET_ADDRESS",
         "MONITOR_ADDRESS",
         "MAX_REBALANCE_USD",
+        # 对账器走独立节点, 测试里必须彻底断开, 否则会真的发出网络请求
+        "SEPOLIA_RPC_URL",
     ):
         monkeypatch.delenv(var, raising=False)
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def audit_path(tmp_path, monkeypatch):
-    """把 Executor 的审计输出重定向到临时目录, 保护真实 logs/audit.jsonl。"""
+    """把 Executor 的审计输出重定向到临时目录, 保护真实 logs/audit.jsonl。
+
+    必须是 autouse: 曾经因为只有部分测试显式请求这个 fixture, 其余测试
+    直接把 dry_run 记录写进了真实审计日志（多出 PROTECT/QUOTE/TELEPORT
+    三条噪音）。审计日志是对账的输入, 被污染会直接影响对账结论。
+    """
     import executor as executor_module
 
     fake = tmp_path / "audit.jsonl"

@@ -44,10 +44,11 @@ Three properties make this pattern a customer-acquisition story, not just a demo
 
 ## Trustlessness
 
-Two independent guarantees, neither of which depends on trusting this codebase:
+Three independent guarantees, none of which depends on trusting this codebase:
 
 1. **Non-custodial signing** — the agent holds only an API key. Signing happens inside KeeperHub's Turnkey wallet. This code cannot exfiltrate a private key because it never has one.
 2. **Fail-closed execution** — `dry_run` defaults to `true`. With no API key or no wallet configured, the fleet refuses to broadcast anything. Every execution carries an `idempotency_key`, so a retry after a network failure cannot double-spend.
+3. **Independent verification** — KeeperHub's execution report is not taken at face value. Every claim it makes is re-checked against a third-party node the agent does not control. See [below](#independent-verification).
 
 The second one matters because a "guardian" that misfires is worse than no guardian. See [Safety](#safety-design).
 
@@ -85,6 +86,44 @@ The projected health factor (1.3077) matched the post-transaction on-chain value
 
 All transactions are `sponsored: true`. Reproduce path 2 with `python scripts/run_live_borrow.py` (add `--dry` to plan without broadcasting).
 
+## Independent verification
+
+Everything above rests on KeeperHub telling us what it did. That is self-reporting, and self-reporting is not evidence.
+
+`logs/audit.jsonl` records what KeeperHub **returned to us**. If it misreported an amount, or reported success on a transaction that actually reverted, the audit log would be wrong and nothing in this repo could tell. So a third layer exists: for every transaction KeeperHub claims to have executed, an **unrelated public node** is asked what actually happened, and the two are reconciled field by field.
+
+```bash
+python scripts/run_reconcile.py
+```
+
+```
+[OK  ] 0x5c32bc4c9094…  PROTECT    13.23 -> 13.230000 USDC  (Repay->Repay)
+  + receipt_available: found on independent node
+  + tx_success: status=1
+  + execution_topology: from=0x809d8252aa… to=0x5af5194b4b… — relayed, gas sponsored
+  + event_emitted: Pool emitted Repay
+  + event_matches_action: PROTECT -> Repay
+  + wallet_matches: event subject = 0x1573c3d151…
+  + amount_matches: claimed 13.23 vs on-chain 13.230000 (delta 0.000000 <= 0.1323)
+
+2/2 claims independently verified
+```
+
+Full output: [`docs/reconciliation-2026-09-03.txt`](docs/reconciliation-2026-09-03.txt). Exit code is non-zero on any discrepancy, so it drops straight into cron or CI.
+
+**A discovery the reconciler made immediately.** KeeperHub executes through a relayer — the on-chain `from` is `0x809d8252…` (the relayer EOA) and `to` is `0x5af5194b…` (KeeperHub's router), not our wallet hitting Aave directly. That is what gas sponsorship looks like on-chain, and it means the obvious check (`from == our_wallet`) fails on every single legitimate transaction. Ownership has to be proven from the `user` / `onBehalfOf` field inside the Pool event, not from transaction fields. The first version got this wrong and flagged both real transactions as mismatches.
+
+**Two directions, one fact set.**
+
+| Path | Direction | Needs infrastructure |
+|---|---|---|
+| `src/reconciler.py` | Pull — ask a third-party node what happened | Nothing. Runs today |
+| [`oz-monitor/`](oz-monitor/) + `src/alert_receiver.py` | Push — an [OpenZeppelin Monitor](https://github.com/openzeppelin/openzeppelin-monitor) instance watches the Pool and signs a webhook to us | A self-hosted Monitor |
+
+The push path's configuration is checked in and ready to drop into a self-hosted Monitor — network, monitor, trigger and a Python filter that discards events belonging to other people's positions. The receiver verifies the `X-Signature` HMAC (`HMAC-SHA256(secret, payload+timestamp)`) and rejects replays outside a 5-minute window.
+
+> **Defender is gone.** OpenZeppelin disabled new Defender sign-ups on 2025-06-30 and retired the hosted platform on 2026-07-01. The only path now is the open-source, self-hosted Monitor (AGPL v3) — which is what this targets. See [`oz-monitor/README.md`](oz-monitor/README.md).
+
 ## The fleet
 
 Five decision agents share one execution layer and one audit pipeline. Each reads real on-chain state; each emits an action that the Executor resolves against KeeperHub.
@@ -119,16 +158,26 @@ keeperhub-agent-economy/
 │   ├── executor.py            # integration core: action → KeeperHub routing + audit
 │   ├── health_factor_agent.py # Aave V3 liquidation defense (live repay)
 │   ├── capital_efficiency_agent.py  # idle-borrowing-power release (live borrow)
-│   ├── env.py                # shared .env loader (keeps secrets out of modules)
+│   ├── env.py                 # shared .env loader (keeps secrets out of modules)
+│   ├── reconciler.py          # pull path: audit log vs third-party node
+│   ├── evm.py                 # minimal JSON-RPC client + Aave event decoding
+│   ├── alert_receiver.py      # push path: signed webhook ingestion
 │   ├── rebalancing_agent.py   # PancakeSwap V3 LP rebalancing
 │   ├── yield_agent.py         # BSC yield routing
 │   ├── grid_agent.py          # BSC grid market-making
 │   └── main.py                # fleet orchestration entrypoint
+├── oz-monitor/                # ready-to-use OpenZeppelin Monitor config
+│   ├── networks/sepolia.json
+│   ├── monitors/aave_v3_keeperhub_execution.json
+│   ├── triggers/keeperhub_webhook.json
+│   └── filters/keeperhub_execution_filter.py   # `--selftest` runs standalone
 ├── scripts/
 │   ├── setup_aave_position_web3.py   # seed a test position to reproduce the demo
 │   ├── test_keeperhub_connection.py  # MCP connectivity smoke test
 │   ├── run_live_borrow.py            # live path 2 (borrow); `--dry` plans only
+│   ├── run_reconcile.py              # independent reconciliation; exit≠0 on drift
 │   └── probe_*.py                    # on-chain diagnostics (tools, caps, reserves)
+├── docs/reconciliation-2026-09-03.txt   # captured reconciliation output
 ├── logs/audit.jsonl           # execution audit trail (gitignored, reproducible)
 ├── .env.example
 └── requirements.txt
@@ -149,7 +198,12 @@ set DRY_RUN=true
 #    copy .env.example -> .env, fill KEEPERHUB_API_KEY / MONITOR_ADDRESS
 set DRY_RUN=false
 .\.venv\Scripts\python src/main.py
+
+# 4) verify — no API key needed; asks an unrelated node what really happened
+.\.venv\Scripts\python scripts/run_reconcile.py
 ```
+
+Step 4 needs no KeeperHub credentials at all. That is the point: it is the check that does not depend on KeeperHub's cooperation. Set `SEPOLIA_RPC_URL` to use your own node; otherwise it falls back through a list of public Sepolia endpoints.
 
 Dry-run output:
 
@@ -169,7 +223,7 @@ skipped            : 0
 
 ## Tests
 
-The safety guarantees above are enforced by a test suite (77 tests, no network access — every on-chain interaction is faked):
+The safety guarantees above are enforced by a test suite (141 tests, no network access — every on-chain interaction is faked):
 
 ```bash
 pip install pytest
@@ -180,6 +234,9 @@ Coverage highlights:
 
 | Suite | What it pins down |
 |---|---|
+| `test_reconciler.py` | the trust layer: a real Repay log reconciling clean, revert reported as `REVERTED`, missing tx as `NOT_FOUND`, RPC failure surfaced not swallowed, wallet/event/amount mismatches each failing independently, and relayed topology recorded without being punished |
+| `test_evm.py` | ABI decoding against **real Sepolia logs** — including the trap where `Borrow`'s non-indexed `user` sits before `amount`, so the amount is the second data word; multi-endpoint fallback; user-agent requirement |
+| `test_alert_receiver.py` | HMAC signature accepted, wrong secret / tampered payload / stale timestamp rejected, replay window, non-object payload rejected, and a rejected webhook writing nothing to disk |
 | `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail, `REBALANCE` venue dispatch, executor-side hard cap blocking oversized borrows |
 | `test_capital_efficiency_agent.py` | the risk model that sizes every borrow: `max_debt = collateral × threshold / HF_target`, safety discount, on-chain cap clamping, negative-headroom clamping, graceful degradation on MCP error / malformed data, and the hand-off boundary where the agent defers to HealthFactor |
 | `test_base_agent.py` | all three kill-switches (drawdown / stale data / consecutive errors), halt semantics, ERC-8004 registration file shape |

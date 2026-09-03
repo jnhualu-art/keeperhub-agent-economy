@@ -1,0 +1,21 @@
+{
+  "keeperhub_execution_webhook": {
+    "name": "KeeperHub Execution Alert Webhook",
+    "trigger_type": "webhook",
+    "config": {
+      "url": {
+        "type": "Environment",
+        "value": "MONITOR_WEBHOOK_URL"
+      },
+      "method": "POST",
+      "secret": {
+        "type": "Environment",
+        "value": "MONITOR_WEBHOOK_SECRET"
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "payload_mode": "raw"
+    }
+  }
+}

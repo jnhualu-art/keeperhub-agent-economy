@@ -103,6 +103,30 @@ The other three agents read live chain data and make real decisions, but run in
 dry-run and do not broadcast. Stated plainly rather than papered over: they prove
 the pattern generalizes to LP rebalancing, yield migration, and market-making.
 
+TRUSTLESSNESS — KeeperHub's own report is not accepted as evidence:
+The audit log records what KeeperHub TOLD us it did. That is self-reporting, and
+self-reporting proves nothing. So every claim is re-checked against a public node
+we do not control: does the transaction exist, did it actually succeed, did the
+Pool emit the event the agent intended, for our wallet, for the amount the agent
+computed. One command — `python scripts/run_reconcile.py` — exits non-zero on any
+drift, so it drops into cron or CI. Result on the two live executions: 2/2
+independently confirmed, amounts matching to zero delta.
+
+Building it surfaced something worth knowing: KeeperHub executes through a
+relayer, so on-chain `from` is the relayer EOA and `to` is KeeperHub's router —
+never our wallet. Checking ownership from transaction fields fails on every
+legitimate sponsored transaction; it can only be proven from the user/onBehalfOf
+field inside the Pool event. The first version got this wrong and flagged both
+real transactions as mismatches.
+
+A push path is configured as well: an OpenZeppelin Monitor watches the Pool and
+HMAC-signs a webhook to us. This is the open-source self-hosted Monitor —
+OpenZeppelin disabled new Defender sign-ups on 2025-06-30 and retired the hosted
+platform on 2026-07-01, so the OSS Monitor is the only path now. It supports any
+EVM chain (Defender did not) plus Solana and Stellar. Network, monitor, trigger
+and filter configs are checked in and ready to deploy; the receiver verifies
+HMAC-SHA256(secret, payload+timestamp) and rejects replays outside a 5m window.
+
 SAFETY (fail-closed by design):
 • dry_run defaults on — no API key or no wallet means no broadcast, ever
 • Hard kill-switch: drawdown limits, stale-data detection, consecutive-failure halts
@@ -117,7 +141,8 @@ SAFETY (fail-closed by design):
 **Tech Stack**：
 ```
 Python 3.13 · Aave V3 (Sepolia) · KeeperHub MCP (Streamable HTTP) ·
-Turnkey Wallet · Etherscan · DefiLlama · DoraHacks
+Turnkey Wallet · OpenZeppelin Monitor (OSS, self-hosted) ·
+Etherscan · DefiLlama · DoraHacks
 ```
 
 **Links**：
@@ -129,6 +154,7 @@ Wallet     : 0x1573C3d151200922375bC48012BB1f232B2cF531
 Repay TX   : https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9
 Borrow TX  : https://sepolia.etherscan.io/tx/0x0a565f54e189515e2fcab74afa28f70b19824ddfdc4ce685d1a974cf137b8897
 Seed TX    : https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587
+Reconcile  : docs/reconciliation-2026-09-03.txt  (2/2 independently verified)
 ```
 
 **Team**：Solo（陆俊华 / [@Jhhu73965779](https://x.com/Jhhu73965779)）
@@ -199,8 +225,21 @@ Seed TX    : https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e6
       `0x0a565f54…8897`（HF 1.3809 → 1.3077，与预测完全吻合）。
       与 HealthFactorAgent 的 repay 形成一守一攻的对照 —— 两个 agent、
       两种相反动作、共用同一执行层与审计管道。
-- [x] 单元测试扩到 **77 个全绿**（新增 29 个：borrow 风控模型、venue 分派、
-      执行层硬上限、负额度截断、MCP 异常降级）
+- [x] 单元测试扩到 **141 个全绿**（新增 64 个：对账逻辑、ABI 解码、webhook 验签）
+- [x] **独立验证层**（2026-09-03 完成，对上 jacob 提的 trustlessness 方向）：
+      - 拉取路径 `src/reconciler.py` + `src/evm.py`：拿**与 KeeperHub 无关**的
+        公共节点核对每一条执行声明（存在性 / status / 事件类型 / 归属钱包 /
+        金额）。**已真跑：2/2 全部核对通过**，金额零偏差。
+        `python scripts/run_reconcile.py`，有分歧时退出码非 0，可直接挂 CI。
+      - 推送路径 `oz-monitor/` + `src/alert_receiver.py`：OpenZeppelin 开源
+        自托管 Monitor 配置已就绪（network / monitor / trigger / filter），
+        接收端做 HMAC-SHA256 验签 + 5 分钟防重放窗口。
+      - ⚠️ **Defender SaaS 已停服**（2025-06-30 停止新注册，2026-07-01 正式
+        退役），必须走开源自托管版 —— README 与 `oz-monitor/README.md` 均已注明。
+      - 踩到的真问题：KeeperHub 是中继执行，链上 `from` 是 relayer EOA、
+        `to` 是 KeeperHub router，拿 tx 字段判归属会误判所有合法交易；
+        归属只能从 Pool 事件的 `user`/`onBehalfOf` 证明。第一版就错在这里，
+        把两笔真交易全判成 MISMATCH。
 
 ### 可选加分项（时间允许）
 
@@ -208,7 +247,7 @@ Seed TX    : https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e6
       （**注意**：Sepolia Aave 各 reserve 的 supply cap 已全部打满 ——
       USDC cap 66536 vs 已供给 42.7 亿。supply 类动作在 Sepolia 上
       对任何人都已封死，只能走 borrow / repay 或换链）
-- [ ] 用 OpenZeppelin Defender Monitor 给 KeeperHub 执行回执加一层监控告警
-      （对上 jacob 提的 trustlessness 方向，且不需要改 KeeperHub 源码）
 - [ ] 把 `execute_check_and_execute` 用起来：把「条件 + 动作」整体交给
       KeeperHub 原子执行，进一步坐实 "conditional execution layer" 这一定位
+- [ ] 真跑一个自托管的 OpenZeppelin Monitor 实例（需要 Docker 或 cargo build，
+      当前未跑；配置与接收端已就绪并已测，链上推送路径待基础设施到位后验证）
