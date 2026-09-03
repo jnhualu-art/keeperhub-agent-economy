@@ -14,15 +14,25 @@ Executor — KeeperHub 真上链执行层 (整合层)
 
 action 类型与映射:
   PROTECT     -> aave-v3/repay        (Aave V3 真还债, 提升健康因子)   [已验证真上链]
-  REBALANCE   -> 生成 PancakeSwap V3 再平衡 plan, 经 execute_contract_call
+  REBALANCE   -> 按 venue 分派:
+                   venue=aave-v3, sub_action=borrow
+                       -> aave-v3/borrow 真借出闲置额度 (资本效率再平衡)  [已验证真上链]
+                   其他 (带 token_id 的 LP 仓位)
+                       -> 生成 PancakeSwap V3 再平衡 plan, 经 execute_contract_call
   MIGRATE     -> 生成收益迁移 plan,   经 execute_contract_call
   ENTER       -> 生成入场 plan,       经 execute_contract_call
   QUOTE       -> 生成网格报价 plan (DEX 下单), 记录不自动点火
 
-说明: 仅 PROTECT 对应 KeeperHub 原生 aave-v3 action, 是当前已验证的
-真上链路径; 其余三类经 KeeperHub 的通用 execute_contract_call / 
-execute_check_and_execute 路由, 其 plan 已就绪, 待对应协议 action 上线
-或 router 集成即可一键点火。dry_run=True 时全部只落审计不点火。
+说明: PROTECT 与 REBALANCE(aave-v3/borrow) 对应 KeeperHub 原生 aave-v3
+action, 是两条已验证的真上链路径 —— 两者共用同一套风控、幂等与审计管道,
+这正是「执行层可复用」而非「一次性 demo」的证据。其余类别经 KeeperHub 的
+通用 execute_contract_call 路由, plan 已就绪。dry_run=True 时全部只落审计
+不点火。
+
+风控约束 (REBALANCE/borrow):
+  借款金额由 CapitalEfficiencyAgent 在 HF 安全线约束下算出, 但执行层不盲信
+ —— 这里再做一次硬上限校验 (MAX_REBALANCE_USD), 防止上游计算或数据异常
+ 导致一笔失控的借款。
 """
 
 from __future__ import annotations
@@ -177,7 +187,88 @@ class Executor:
 
     def _handle_rebalance(self, action: dict, base: dict) -> dict:
         """
-        REBALANCE -> 生成 PancakeSwap V3 再平衡 plan。
+        REBALANCE 分派器。
+
+        venue=aave-v3 且 sub_action=borrow -> 走 Aave V3 真借出 (资本效率再平衡);
+        否则 (带 token_id 的 LP 仓位) -> 生成 PancakeSwap V3 多步再平衡 plan。
+        """
+        if action.get("venue") == "aave-v3" and action.get("sub_action") == "borrow":
+            return self._handle_ce_borrow(action, base)
+        return self._handle_lp_rebalance(action, base)
+
+    def _handle_ce_borrow(self, action: dict, base: dict) -> dict:
+        """
+        REBALANCE(aave-v3/borrow) -> 真借出闲置额度, 把过度抵押的仓位盘活。
+
+        金额由 CapitalEfficiencyAgent 在「借后 HF 仍 >= hf_target」约束下算出;
+        执行层再校验一次硬上限 MAX_REBALANCE_USD, 不盲信上游。
+        """
+        from config import token_addr, token_decimals
+
+        asset = action.get("asset", "USDC")
+        amount_base = action.get("amount_base")
+        amount_usd = float(action.get("amount_usd", 0.0))
+
+        # amount_base 缺失时按 USD + token decimals 现算
+        if not amount_base:
+            decimals = token_decimals(asset)
+            amount_base = str(int(round(amount_usd * (10 ** decimals))))
+
+        # 执行层硬上限, 兜住上游计算或数据异常
+        max_usd = float(os.getenv("MAX_REBALANCE_USD", "10000"))
+        if amount_usd > max_usd:
+            base["note"] = (
+                f"REBALANCE borrow blocked: {amount_usd} USD exceeds "
+                f"MAX_REBALANCE_USD={max_usd}"
+            )
+            logger.warning(base["note"])
+            return base
+
+        if self.dry_run or self.client is None:
+            base["note"] = (
+                f"[DRY_RUN] would borrow {amount_usd} USD of {asset} on Aave V3 "
+                f"(HF {action.get('hf_before')} -> {action.get('hf_after')})"
+            )
+            base["plan"] = {
+                "tool": "execute_protocol_action",
+                "actionType": "aave-v3/borrow",
+                "params": {
+                    "network": os.getenv("CHAIN_ID", "11155111"),
+                    "asset": token_addr(asset),
+                    "amount": amount_base,
+                    "interestRateMode": action.get("interest_rate_mode", "2"),
+                    "onBehalfOf": os.getenv("WALLET_ADDRESS", ""),
+                    "referralCode": "0",
+                },
+            }
+            logger.info("REBALANCE(borrow) dry_run: %s", base["note"])
+            return base
+
+        # 真上链
+        try:
+            res = self.client.borrow(
+                asset=token_addr(asset),
+                amount=amount_base,
+                interest_rate_mode=action.get("interest_rate_mode", "2"),
+                idempotency_key=f"ce-borrow-{int(time.time())}",
+            )
+            tx = res.get("transactionHash") or res.get("result", {}).get("transactionHash")
+            base["executed"] = True
+            base["tx_hash"] = tx
+            base["note"] = (
+                f"borrowed {amount_usd} USD {asset} on Aave V3, "
+                f"HF {action.get('hf_before')} -> {action.get('hf_after')}, tx={tx}"
+            )
+            logger.info("REBALANCE(borrow) executed: %s", base["note"])
+        except MCPError as exc:
+            base["error"] = str(exc)
+            base["note"] = "REBALANCE on-chain borrow failed (see error)"
+            logger.error("REBALANCE borrow failed: %s", exc)
+        return base
+
+    def _handle_lp_rebalance(self, action: dict, base: dict) -> dict:
+        """
+        生成 PancakeSwap V3 再平衡 plan。
         LP 再平衡是多步交易 (decrease + increase liquidity via NonfungiblePositionManager),
         经 KeeperHub execute_contract_call 路由。plan 已就绪, dry_run 只记录。
         """

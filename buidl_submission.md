@@ -44,14 +44,32 @@ without its owner being online.
            → Executor resolves action → KeeperHub MCP → Turnkey signs
            → aave-v3/repay broadcast → HF recovers → audit.jsonl
 
-This is not a plan-only demo. The full path executed a complete defensive cycle on
-Aave V3 (Sepolia):
+This is not a plan-only demo. TWO different agents drove TWO opposite DeFi actions
+on Aave V3 (Sepolia) — through the same Executor, the same risk controls and the
+same audit pipeline:
 
+  PATH 1 — DEFEND (HealthFactorAgent lowers risk):
   • Borrow 27 USDC via KeeperHub   → HF 1.5668 → 1.2471 (WARN)
   • Agent computes PROTECT: repay 13.23 USDC
   • Executor routes aave-v3/repay  → HF 1.2471 → 1.3856 (recovered)
 
-Both transactions are sponsored (gas paid by the KeeperHub relay; the wallet held no
+  PATH 2 — ATTACK (CapitalEfficiencyAgent puts idle capital to work):
+  The mirror-image problem: users over-collateralise for safety and leave borrowing
+  power sitting idle, earning nothing. This position had 40.52 USD of unused
+  borrowing power parked at HF 1.38, far above the 1.0 liquidation line.
+  • Agent reads the position (collateral 200.00 / debt 119.48 / available 40.52)
+  • Solves for the borrow size that keeps HF at or above a 1.30 floor, applies a
+    0.90 safety discount, then clamps to the on-chain borrow limit → borrow 6.69 USDC
+  • Executor routes aave-v3/borrow → HF 1.3809 → 1.3077, exactly as predicted
+
+The projected health factor (1.3077) matched the post-transaction on-chain value
+exactly, and the wallet's USDC balance moved 111.269811 → 117.959811.
+
+Why two paths matter more than one: a single executed transaction proves KeeperHub
+can broadcast. Two agents driving opposite actions through one shared execution
+layer is what makes this a layer rather than a one-off script.
+
+All transactions are sponsored (gas paid by the KeeperHub relay; the wallet held no
 ETH) and fully verifiable on Etherscan.
 
 WHY THIS IS A CUSTOMER-ACQUISITION STORY, NOT JUST A DEMO:
@@ -65,18 +83,25 @@ WHY THIS IS A CUSTOMER-ACQUISITION STORY, NOT JUST A DEMO:
 • Every action is auditable — logs/audit.jsonl records each decision, each skip, and
   the reason, so the agent's full decision history can be replayed.
 
-THE FLEET (4 agents, one execution layer, one audit pipeline):
+THE FLEET (5 agents, one execution layer, one audit pipeline):
 • HealthFactorAgent — Aave V3 health factor tiering + exact repay sizing
   → aave-v3/repay, EXECUTED ON-CHAIN
+• CapitalEfficiencyAgent — solves for the borrow size that keeps HF above a hard
+  floor (max_debt = collateral x threshold / HF_target), applies a safety discount
+  and the on-chain borrow cap → aave-v3/borrow, EXECUTED ON-CHAIN
 • RebalancingAgent — PancakeSwap V3 LP out-of-range detection + new range
 • YieldAgent — DefiLlama BSC APY/TVL, risk-adjusted, migrate only if uplift > 15%
 • GridAgent — BSC DEX/CEX divergence + ATR, chain-anchored quoting + kill-switch
 
-Only HealthFactor has executed on testnet. The other three read live chain data and
-make real decisions, but run in dry-run and do not broadcast. Stated plainly rather
-than papered over: one verified execution path proves the integration; the other
-three prove the pattern generalizes to LP rebalancing, yield migration, and
-market-making.
+HealthFactor and CapitalEfficiency are deliberately paired: they manage the SAME
+Aave position in opposite directions, with bounded responsibilities so they never
+fight. CapitalEfficiency borrows only while HF stays above 1.35 and hands off
+entirely below 1.30 — below that the position belongs to HealthFactor, whose job is
+to repay.
+
+The other three agents read live chain data and make real decisions, but run in
+dry-run and do not broadcast. Stated plainly rather than papered over: they prove
+the pattern generalizes to LP rebalancing, yield migration, and market-making.
 
 SAFETY (fail-closed by design):
 • dry_run defaults on — no API key or no wallet means no broadcast, ever
@@ -100,9 +125,10 @@ Turnkey Wallet · Etherscan · DefiLlama · DoraHacks
 Repo      : https://github.com/jnhualu-art/keeperhub-agent-economy
 Demo      : https://youtu.be/C48UpGSQJLQ
 Hackathon : https://dorahacks.io/hackathon/agent-economy/detail
-Wallet    : 0x1573C3d151200922375bC48012BB1f232B2cF531
-Borrow TX : https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587
-Repay TX  : https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9
+Wallet     : 0x1573C3d151200922375bC48012BB1f232B2cF531
+Repay TX   : https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9
+Borrow TX  : https://sepolia.etherscan.io/tx/0x0a565f54e189515e2fcab74afa28f70b19824ddfdc4ce685d1a974cf137b8897
+Seed TX    : https://sepolia.etherscan.io/tx/0x3985c67d4068e3756f04378f7f72575e63d9fbbe6ea0bb82cf08e50f1ac79587
 ```
 
 **Team**：Solo（陆俊华 / [@Jhhu73965779](https://x.com/Jhhu73965779)）
@@ -166,11 +192,23 @@ Repay TX  : https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849
 - [ ] 9/6 12:00 CEST 提交闸门开闸 → Submit BUIDL（主赛道 Best Integration）
 - [ ] 9/18 12:00 CEST 前可继续改 BUIDL
 
+### 已完成加分项
+
+- [x] **第二条真上链路径**（2026-09-03 完成）：新增 CapitalEfficiencyAgent，
+      经同一 Executor 走 `aave-v3/borrow` 真借出，tx
+      `0x0a565f54…8897`（HF 1.3809 → 1.3077，与预测完全吻合）。
+      与 HealthFactorAgent 的 repay 形成一守一攻的对照 —— 两个 agent、
+      两种相反动作、共用同一执行层与审计管道。
+- [x] 单元测试扩到 **77 个全绿**（新增 29 个：borrow 风控模型、venue 分派、
+      执行层硬上限、负额度截断、MCP 异常降级）
+
 ### 可选加分项（时间允许）
 
-- [ ] 让 Rebalancing / Yield / Grid 中**至少 1 个**也真跑一笔链上交易
-      （目前只有 HealthFactor 真上链，"4 agent 舰队"卖点打折）
-- [x] 补单元测试（48 个全绿：executor 风控/审计、kill-switch、HF 分级与还款额、
-      interestRateMode 防回归、Sepolia 实盘场景回归；2026-09-02 完成）
+- [ ] 让 Rebalancing / Yield / Grid 中再跑一笔链上交易
+      （**注意**：Sepolia Aave 各 reserve 的 supply cap 已全部打满 ——
+      USDC cap 66536 vs 已供给 42.7 亿。supply 类动作在 Sepolia 上
+      对任何人都已封死，只能走 borrow / repay 或换链）
 - [ ] 用 OpenZeppelin Defender Monitor 给 KeeperHub 执行回执加一层监控告警
       （对上 jacob 提的 trustlessness 方向，且不需要改 KeeperHub 源码）
+- [ ] 把 `execute_check_and_execute` 用起来：把「条件 + 动作」整体交给
+      KeeperHub 原子执行，进一步坐实 "conditional execution layer" 这一定位

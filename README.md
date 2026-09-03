@@ -53,9 +53,13 @@ The second one matters because a "guardian" that misfires is worse than no guard
 
 ## Live on-chain proof
 
-This is not a plan-only demo. The full path `HealthFactorAgent → Executor → KeeperHub MCP → Aave V3 Sepolia` executed a complete defensive cycle on testnet. Both transactions are publicly verifiable.
+This is not a plan-only demo. **Two different agents, two different DeFi actions, one shared execution layer** — both broadcast on Sepolia through KeeperHub and publicly verifiable.
 
 **Monitored wallet**: `0x1573C3d151200922375bC48012BB1f232B2cF531`
+
+### Path 1 — Defend: HealthFactorAgent repays debt when HF drops
+
+`HealthFactorAgent → Executor → KeeperHub MCP → Aave V3 Sepolia`
 
 | Stage | Action | Health factor | On-chain proof |
 |---|---|---|---|
@@ -63,20 +67,39 @@ This is not a plan-only demo. The full path `HealthFactorAgent → Executor → 
 | ② Agent decides | Reads HF = 1.2471 → WARN → emits PROTECT (repay 13.23 USDC) | — | `logs/audit.jsonl` |
 | ③ Self-heal | Executor routes `aave-v3/repay`, broadcast via KeeperHub | **1.2471 → 1.3856** (recovered) | [`0x5c32bc4c…759e9`](https://sepolia.etherscan.io/tx/0x5c32bc4c9094e96210ad2b1a4149310849c64429a1e5a003fd6192c7a8d759e9) |
 
-Both transactions are `sponsored: true`. Reproduce with `DRY_RUN=false python src/main.py`.
+### Path 2 — Attack: CapitalEfficiencyAgent frees idle borrowing power when HF is too high
+
+`CapitalEfficiencyAgent → Executor → KeeperHub MCP → Aave V3 Sepolia`
+
+The mirror-image problem is just as common: users over-collateralise for safety and leave borrowing power sitting idle, earning nothing. This position had **40.52 USD of unused borrowing power** parked at HF 1.38 — far above the 1.0 liquidation line.
+
+| Stage | Action | Health factor | On-chain proof |
+|---|---|---|---|
+| ① Agent reads position | `aave-v3/get-user-account-data` → collateral 200.00 / debt 119.48 / available 40.52 | 1.3809 | `logs/audit.jsonl` |
+| ② Agent sizes the move | Solves for the borrow that keeps HF ≥ 1.30, applies a 0.90 safety discount, caps at the on-chain borrow limit → **borrow 6.69 USDC** | projected **1.3077** | `logs/audit.jsonl` |
+| ③ Broadcast | Executor routes `aave-v3/borrow` via KeeperHub | **1.3809 → 1.3077** (as predicted) | [`0x0a565f54…8897`](https://sepolia.etherscan.io/tx/0x0a565f54e189515e2fcab74afa28f70b19824ddfdc4ce685d1a974cf137b8897) |
+
+The projected health factor (1.3077) matched the post-transaction on-chain value exactly, and the wallet's USDC balance moved 111.269811 → 117.959811.
+
+**Why two paths matter more than one.** A single executed transaction proves KeeperHub can broadcast. Two agents driving *opposite* actions — one repaying to raise HF, one borrowing to lower it — through the same Executor, the same risk controls and the same audit pipeline is what makes this an execution **layer** rather than a one-off script.
+
+All transactions are `sponsored: true`. Reproduce path 2 with `python scripts/run_live_borrow.py` (add `--dry` to plan without broadcasting).
 
 ## The fleet
 
-Four decision agents share one execution layer and one audit pipeline. Each reads real on-chain state; each emits an action that the Executor resolves against KeeperHub.
+Five decision agents share one execution layer and one audit pipeline. Each reads real on-chain state; each emits an action that the Executor resolves against KeeperHub.
 
 | Agent | Reads | Decides | KeeperHub action |
 |---|---|---|---|
 | **HealthFactor** (`hfsentinel.agent`) | Aave V3 `getUserAccountData` | HF tiering (SAFE/WARN/DANGER/CRITICAL) + exact repay sizing | `aave-v3/repay` — **executed on-chain** ✅ |
+| **CapitalEfficiency** (`capital-efficiency.agent`) | Aave V3 `getUserAccountData` | Solves for the borrow size that keeps HF above a hard floor, then applies a safety discount and the on-chain borrow cap | `aave-v3/borrow` — **executed on-chain** ✅ |
 | **Rebalancing** (`rangeguard.agent`) | PancakeSwap V3 position ticks + pool `slot0` | Out-of-range / near-boundary detection, new range | `execute_contract_call` plan |
 | **Yield** (`yieldpilot.agent`) | DefiLlama BSC pool APY / TVL | Risk-adjusted score, migrate only if uplift > 15% | `execute_contract_call` plan |
 | **Grid** (`silent-martin.agent`) | BSC DEX price + CEX divergence + ATR | Chain-anchored quoting + inventory skew + kill-switch | DEX grid quoting plan |
 
-**Only HealthFactor has executed on testnet.** The other three produce fully-formed, ready-to-fire call plans but run `dry_run: true` — they read live chain data and make real decisions, but do not broadcast. This is stated plainly rather than papered over: one verified execution path proves the integration; the other three prove the pattern generalizes.
+**HealthFactor and CapitalEfficiency have executed on testnet.** The other three produce fully-formed, ready-to-fire call plans but run `dry_run: true` — they read live chain data and make real decisions, but do not broadcast. This is stated plainly rather than papered over.
+
+HealthFactor and CapitalEfficiency are deliberately paired: they manage the *same* Aave position in opposite directions, and their responsibilities are bounded so they never fight each other. CapitalEfficiency only borrows while HF stays above 1.35, and hands off entirely below 1.30 — below that the position belongs to HealthFactor, whose job is to repay.
 
 ## Safety design
 
@@ -94,14 +117,18 @@ keeperhub-agent-economy/
 │   ├── config.py              # Aave V3 / KeeperHub / token constants
 │   ├── keeperhub_client.py    # KeeperHub MCP HTTP client (execution layer)
 │   ├── executor.py            # integration core: action → KeeperHub routing + audit
-│   ├── health_factor_agent.py # Aave V3 liquidation defense (flagship, live repay)
+│   ├── health_factor_agent.py # Aave V3 liquidation defense (live repay)
+│   ├── capital_efficiency_agent.py  # idle-borrowing-power release (live borrow)
+│   ├── env.py                # shared .env loader (keeps secrets out of modules)
 │   ├── rebalancing_agent.py   # PancakeSwap V3 LP rebalancing
 │   ├── yield_agent.py         # BSC yield routing
 │   ├── grid_agent.py          # BSC grid market-making
 │   └── main.py                # fleet orchestration entrypoint
 ├── scripts/
 │   ├── setup_aave_position_web3.py   # seed a test position to reproduce the demo
-│   └── test_keeperhub_connection.py  # MCP connectivity smoke test
+│   ├── test_keeperhub_connection.py  # MCP connectivity smoke test
+│   ├── run_live_borrow.py            # live path 2 (borrow); `--dry` plans only
+│   └── probe_*.py                    # on-chain diagnostics (tools, caps, reserves)
 ├── logs/audit.jsonl           # execution audit trail (gitignored, reproducible)
 ├── .env.example
 └── requirements.txt
@@ -142,7 +169,7 @@ skipped            : 0
 
 ## Tests
 
-The safety guarantees above are enforced by a test suite (48 tests, no network access — every on-chain interaction is faked):
+The safety guarantees above are enforced by a test suite (77 tests, no network access — every on-chain interaction is faked):
 
 ```bash
 pip install pytest
@@ -153,7 +180,8 @@ Coverage highlights:
 
 | Suite | What it pins down |
 |---|---|
-| `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail |
+| `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail, `REBALANCE` venue dispatch, executor-side hard cap blocking oversized borrows |
+| `test_capital_efficiency_agent.py` | the risk model that sizes every borrow: `max_debt = collateral × threshold / HF_target`, safety discount, on-chain cap clamping, negative-headroom clamping, graceful degradation on MCP error / malformed data, and the hand-off boundary where the agent defers to HealthFactor |
 | `test_base_agent.py` | all three kill-switches (drawdown / stale data / consecutive errors), halt semantics, ERC-8004 registration file shape |
 | `test_health_factor_agent.py` | Aave base-unit normalization (incl. `2^256-1` → `inf` for no-debt), SAFE/WARN/CRITICAL thresholds, repay sizing per tier, plus a regression test replaying the real Sepolia incident (HF 1.2471 → repay 13.23 USDC) |
 | `test_keeperhub_client.py` | amount→base-unit conversion, `interestRateMode` required-field regression, idempotency-key attempt suffixing, retry exhaustion, error normalization to `MCPError` |

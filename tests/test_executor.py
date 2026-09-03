@@ -32,6 +32,12 @@ class FakeClient:
             raise MCPError(self.error)
         return self.result
 
+    def borrow(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise MCPError(self.error)
+        return self.result
+
 
 def _protect_action(repay_usd=13.23, **extra):
     action = {
@@ -41,6 +47,24 @@ def _protect_action(repay_usd=13.23, **extra):
         "target_hf": 2.0,
         "repay_usd": repay_usd,
         "repay_asset": "USDC",
+    }
+    action.update(extra)
+    return action
+
+
+def _ce_borrow_action(amount_usd=6.69, amount_base="6690000", **extra):
+    """CapitalEfficiencyAgent 产出的资本效率再平衡 action"""
+    action = {
+        "type": "REBALANCE",
+        "venue": "aave-v3",
+        "sub_action": "borrow",
+        "asset": "USDC",
+        "amount_usd": amount_usd,
+        "amount_base": amount_base,
+        "interest_rate_mode": "2",
+        "hf_before": 1.3809,
+        "hf_after": 1.3077,
+        "hf_target": 1.30,
     }
     action.update(extra)
     return action
@@ -200,3 +224,82 @@ class TestAudit:
         )
         rec = ex.execute_batch([_protect_action()])
         assert rec[0]["type"] == "PROTECT"  # 执行结果正常返回
+
+
+# ---------------------------------------------------------------------------
+# 第二条真上链路径: REBALANCE(aave-v3/borrow)
+# ---------------------------------------------------------------------------
+
+class TestCapitalEfficiencyBorrowRouting:
+    """REBALANCE 按 venue 分派: aave-v3/borrow 走真执行, LP 仓位仍走 plan。"""
+
+    def test_ce_borrow_routes_to_aave_borrow_not_lp_plan(self):
+        ex = Executor(dry_run=True)
+        rec = ex.execute_action(_ce_borrow_action())
+        assert rec["plan"]["actionType"] == "aave-v3/borrow"
+        assert rec["plan"]["tool"] == "execute_protocol_action"
+
+    def test_lp_rebalance_still_produces_multistep_plan(self):
+        """没带 venue 的 REBALANCE 是 LP 仓位, 行为必须保持向后兼容"""
+        ex = Executor(dry_run=True)
+        rec = ex.execute_action(
+            {"type": "REBALANCE", "token_id": 42, "pair": "WETH/USDC", "new_tick_lower": -100}
+        )
+        assert "PancakeSwap" in rec["plan"]["target"]
+        assert len(rec["plan"]["steps"]) == 3
+
+    def test_dry_run_emits_plan_and_never_executes(self):
+        ex = Executor(dry_run=True)
+        rec = ex.execute_action(_ce_borrow_action())
+        assert rec["executed"] is False
+        assert rec["tx_hash"] is None
+        assert "[DRY_RUN]" in rec["note"]
+        params = rec["plan"]["params"]
+        assert params["amount"] == "6690000"       # 6.69 USDC, 6 位小数
+        assert params["interestRateMode"] == "2"
+        assert params["referralCode"] == "0"
+
+    def test_live_path_executes_and_records_tx_hash(self):
+        client = FakeClient(result={"transactionHash": "0x" + "cd" * 32})
+        ex = Executor(dry_run=False, client=client)
+        rec = ex.execute_action(_ce_borrow_action())
+        assert rec["executed"] is True
+        assert rec["tx_hash"] == "0x" + "cd" * 32
+        assert "borrowed 6.69 USD USDC" in rec["note"]
+
+    def test_live_path_passes_through_idempotency_key(self):
+        client = FakeClient()
+        ex = Executor(dry_run=False, client=client)
+        ex.execute_action(_ce_borrow_action())
+        assert client.calls[0]["idempotency_key"].startswith("ce-borrow-")
+
+    def test_live_path_forwards_interest_rate_mode(self):
+        client = FakeClient()
+        ex = Executor(dry_run=False, client=client)
+        ex.execute_action(_ce_borrow_action(interest_rate_mode="1"))
+        assert client.calls[0]["interest_rate_mode"] == "1"
+
+    def test_amount_base_is_derived_when_missing(self):
+        """上游只给了 USD 金额时, 执行层应能按 token 精度自行换算"""
+        ex = Executor(dry_run=True)
+        rec = ex.execute_action(_ce_borrow_action(amount_usd=2.5, amount_base=None))
+        assert rec["plan"]["params"]["amount"] == "2500000"   # 2.5 * 10^6
+
+    def test_hard_cap_blocks_oversized_borrow(self, monkeypatch):
+        """执行层硬上限: 不盲信上游算出的金额"""
+        monkeypatch.setenv("MAX_REBALANCE_USD", "5")
+        ex = Executor(dry_run=True)
+        rec = ex.execute_action(_ce_borrow_action(amount_usd=6.69))
+        assert rec["executed"] is False
+        assert rec["plan"] is None
+        assert "exceeds MAX_REBALANCE_USD" in rec["note"]
+
+    def test_mcp_error_is_recorded_not_raised(self):
+        """KeeperHub 报错不应打挂 batch, 而应记在记录里"""
+        client = FakeClient(error="HTTP 400: borrow cap exceeded")
+        ex = Executor(dry_run=False, client=client)
+        rec = ex.execute_action(_ce_borrow_action())
+        assert rec["executed"] is False
+        assert rec["tx_hash"] is None
+        assert "borrow cap exceeded" in rec["error"]
+        assert "failed" in rec["note"]
