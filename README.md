@@ -223,12 +223,14 @@ skipped            : 0
 
 ## Tests
 
-The safety guarantees above are enforced by a test suite (141 tests, no network access — every on-chain interaction is faked):
+The safety guarantees above are enforced by a test suite (149 tests, no network access — every on-chain interaction is faked):
 
 ```bash
 pip install pytest
-python -m pytest tests/ -v
+python -m pytest
 ```
+
+No flags needed: `pytest.ini` pins collection to `tests/` and disables the `xonsh` plugin, which otherwise crashes the session in any non-terminal environment (CI, background execution).
 
 Coverage highlights:
 
@@ -239,6 +241,7 @@ Coverage highlights:
 | `test_alert_receiver.py` | HMAC signature accepted, wrong secret / tampered payload / stale timestamp rejected, replay window, non-object payload rejected, and a rejected webhook writing nothing to disk |
 | `test_executor.py` | dry-run plan unit conversion (USDC 6-decimals, `interestRateMode=2`), fail-closed fallback when no API key, live path emits tx hash, MCP errors recorded not raised, JSONL audit trail, `REBALANCE` venue dispatch, executor-side hard cap blocking oversized borrows |
 | `test_capital_efficiency_agent.py` | the risk model that sizes every borrow: `max_debt = collateral × threshold / HF_target`, safety discount, on-chain cap clamping, negative-headroom clamping, graceful degradation on MCP error / malformed data, and the hand-off boundary where the agent defers to HealthFactor |
+| `test_test_isolation.py` | meta-tests: the suite cannot see real credentials, and `KeeperHubClient`'s bound default `api_key` is empty. Guards against a bug where `scripts/test_keeperhub_connection.py` matched pytest's `test_*.py` pattern, got imported during collection, and loaded `.env` before `src.config` snapshotted the real API key — so single-file runs passed while full runs failed *and ran holding live credentials* |
 | `test_base_agent.py` | all three kill-switches (drawdown / stale data / consecutive errors), halt semantics, ERC-8004 registration file shape |
 | `test_health_factor_agent.py` | Aave base-unit normalization (incl. `2^256-1` → `inf` for no-debt), SAFE/WARN/CRITICAL thresholds, repay sizing per tier, plus a regression test replaying the real Sepolia incident (HF 1.2471 → repay 13.23 USDC) |
 | `test_keeperhub_client.py` | amount→base-unit conversion, `interestRateMode` required-field regression, idempotency-key attempt suffixing, retry exhaustion, error normalization to `MCPError` |
