@@ -35,7 +35,20 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from web3 import Web3
+def _web3():
+    """惰性导入 web3 —— 理由同 grid_agent._web3()。
+
+    tick 对齐与区间计算是纯算术, 不该被一条坏掉的 web3 依赖链挡在可测
+    范围之外。只在真正发起 RPC 时才要求 web3 可用。
+    """
+    try:
+        from web3 import Web3
+    except ImportError as exc:
+        raise RuntimeError(
+            "web3 不可用, 无法发起链上调用(区间计算本身不需要 web3)"
+        ) from exc
+    return Web3
+
 
 from base_agent import (
     CATEGORY_REBALANCING,
@@ -200,10 +213,33 @@ def price_to_tick(price: float) -> int:
 
 
 def align_to_spacing(tick: int, spacing: int) -> int:
-    """把 tick 对齐到池子的 tickSpacing(链上要求必须是 spacing 的整数倍)"""
+    """把 tick 对齐到池子的 tickSpacing(链上要求必须是 spacing 的整数倍)。
+
+    向下对齐(朝 -inf)。保留此函数仅为兼容既有调用方; 新代码应显式选择
+    方向 —— 见 align_down / align_up, 方向选错会直接改变区间大小。
+    """
     if not spacing:
         return tick
     return (tick // spacing) * spacing
+
+
+def align_down(tick: int, spacing: int) -> int:
+    """向下对齐 —— 用于区间下界: 只会让区间变宽, 不会把现价挤出区间。"""
+    if not spacing:
+        return tick
+    return (tick // spacing) * spacing
+
+
+def align_up(tick: int, spacing: int) -> int:
+    """向上对齐 —— 用于区间上界。
+
+    上界必须向上对齐: 向下对齐会缩窄区间, 实测在 range_width_pct=0.001
+    这类极窄配置下上下界会被压到同一个 tick, 产生空区间 —— 链上必然失败,
+    而且失败前从数据上看不出任何异常。
+    """
+    if not spacing:
+        return tick
+    return -((-tick) // spacing) * spacing
 
 
 class RebalancingAgent(BaseAgent):
@@ -218,13 +254,13 @@ class RebalancingAgent(BaseAgent):
         self.rpc_url = self.config.rpc_url or pick_rpc(BSC_RPCS)
         self.w3 = make_web3(self.rpc_url, timeout=25)
         self.pm = self.w3.eth.contract(
-            address=Web3.to_checksum_address(PANCAKE_V3_POSITION_MANAGER),
+            address=_web3().to_checksum_address(PANCAKE_V3_POSITION_MANAGER),
             abi=POSITION_MANAGER_ABI,
         )
         # factory 动态解析: 兼容 Uniswap V3 与 PancakeSwap V3 部署
         self.factory_address = self.pm.functions.factory().call()
         self.factory = self.w3.eth.contract(
-            address=Web3.to_checksum_address(self.factory_address), abi=FACTORY_ABI
+            address=_web3().to_checksum_address(self.factory_address), abi=FACTORY_ABI
         )
         self._symbol_cache: dict[str, str] = {}
 
@@ -259,7 +295,7 @@ class RebalancingAgent(BaseAgent):
         if not self.config.monitored_address:
             raise ValueError("必须设置 monitored_address 或 token_ids")
 
-        owner = Web3.to_checksum_address(self.config.monitored_address)
+        owner = _web3().to_checksum_address(self.config.monitored_address)
         n = self.pm.functions.balanceOf(owner).call()
         n = min(n, self.config.max_positions)
 
@@ -301,7 +337,7 @@ class RebalancingAgent(BaseAgent):
         if pool_addr == "0x" + "0" * 40:
             return None
 
-        pool_cs = Web3.to_checksum_address(pool_addr)
+        pool_cs = _web3().to_checksum_address(pool_addr)
         pool = self.w3.eth.contract(address=pool_cs, abi=POOL_ABI)
         slot0 = pool.functions.slot0().call()
         current_tick = slot0[1]
@@ -341,7 +377,7 @@ class RebalancingAgent(BaseAgent):
         }
 
     def _symbol(self, token_addr: str) -> str:
-        cs = Web3.to_checksum_address(token_addr)
+        cs = _web3().to_checksum_address(token_addr)
         if cs in self._symbol_cache:
             return self._symbol_cache[cs]
         try:
@@ -364,8 +400,17 @@ class RebalancingAgent(BaseAgent):
         upper_price = price * (1 + width)
 
         spacing = pos["tick_spacing"]
-        new_lower = align_to_spacing(price_to_tick(lower_price), spacing)
-        new_upper = align_to_spacing(price_to_tick(upper_price), spacing)
+        # 下界向下、上界向上: 两个方向都是「往外扩」, 保证现价仍在区间内。
+        new_lower = align_down(price_to_tick(lower_price), spacing)
+        new_upper = align_up(price_to_tick(upper_price), spacing)
+
+        # 兜底: 配置宽度小于一个 tickSpacing 时, 即便双向外扩, 上下界仍可能
+        # 撞在一起(如 width=0.001% 时 46053/46054 都对齐到 46050)。空区间
+        # 上链必然 revert, 宁可把区间撑到最小可用宽度。
+        widened = False
+        if new_upper <= new_lower:
+            new_upper = new_lower + spacing
+            widened = True
 
         return {
             "new_tick_lower": new_lower,
@@ -373,6 +418,7 @@ class RebalancingAgent(BaseAgent):
             "new_price_lower": tick_to_price(new_lower),
             "new_price_upper": tick_to_price(new_upper),
             "width_pct": self.config.range_width_pct,
+            "widened_to_min_width": widened,
         }
 
     def run_cycle(self) -> dict:

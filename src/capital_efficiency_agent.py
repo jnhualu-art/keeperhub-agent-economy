@@ -47,6 +47,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +69,19 @@ logger = logging.getLogger(__name__)
 # Aave 用 uint256.max 表示「无债务」时的健康因子
 _UINT256_MAX = 2 ** 256 - 1
 
+# 清算线是 HF = 1.0。hf_target 的语义是「借款后必须保住的最低 HF」, 所以这个
+# 值本身必须显著高于 1.0, 否则整条风控承诺就是空话: 配成 1.01 意味着本 agent
+# 会主动把仓位推到离清算只有 1% 的位置, 而 executor 的清算地板(1.0)对此
+# 无能为力 —— 它只挡已经越线的, 不挡贴着线的。
+#
+# 1.10 是权衡后的下限: 既能吸收一次中等幅度的抵押品回撤, 又不会保守到让
+# agent 在大多数仓位上无事可做。默认值 1.30 远高于它。
+MIN_HF_TARGET = 1.10
+
+# safety_factor 必须落在 (0, 1]。超过 1 等于放大理论额度, 那 safety 就成了
+# risk; 为 0 则永远不借, 静默失效比报错更难发现。
+MIN_SAFETY_FACTOR = 0.01
+
 
 @dataclass
 class CapitalEfficiencyConfig(AgentConfig):
@@ -85,12 +99,57 @@ class CapitalEfficiencyConfig(AgentConfig):
     interest_rate_mode: str = "2"   # Aave V3: 1=stable, 2=variable
     monitor_address: str = ""       # 空 = 用 WALLET_ADDRESS
 
+    def __post_init__(self) -> None:
+        """风控参数在构造时就校验, 而不是等到算出危险金额才发现。
+
+        这些是编程错误而非运行时状况 —— 一个配错的 hf_target 不会在运行时
+        自己变好, 让它在启动时炸掉远比让它在半夜借一笔钱要好。
+        """
+        if self.hf_target < MIN_HF_TARGET:
+            raise ValueError(
+                f"hf_target={self.hf_target} 低于安全下限 {MIN_HF_TARGET}: "
+                f"清算线是 1.0, 目标 HF 必须留出足够缓冲, 否则本 agent 的"
+                f"风控承诺不成立"
+            )
+        if self.hf_idle_threshold <= self.hf_target:
+            raise ValueError(
+                f"hf_idle_threshold={self.hf_idle_threshold} 必须大于 "
+                f"hf_target={self.hf_target}: 否则「HF 高于目标」与「安全垫过厚」"
+                f"两个条件互相矛盾, agent 永远不会建议借款"
+            )
+        if not (MIN_SAFETY_FACTOR <= self.safety_factor <= 1.0):
+            raise ValueError(
+                f"safety_factor={self.safety_factor} 必须落在 "
+                f"[{MIN_SAFETY_FACTOR}, 1.0]: 大于 1 是放大额度而非打折"
+            )
+
 
 def _normalize_hf(raw: int) -> float:
     """Aave 的健康因子是 1e18 精度的整数; uint256.max 代表「无债务」"""
     if raw >= _UINT256_MAX:
         return float("inf")
     return raw / 1e18
+
+
+def round_down_to_cent(usd: float) -> Decimal:
+    """把金额向下取整到分。
+
+    必须用 Decimal: int(1.13 * 100) == 112, 因为二进制浮点里
+    1.13 * 100 == 112.99999999999999。实测 0.01~20000 USD 区间有数千个
+    金额会因此少一分。
+
+    取整方向向下(少借), 所以不产生资金风险, 但会让「建议金额」与链上
+    「实际金额」对不上 —— 而本项目的对账层正是靠比对这两者工作的。
+    """
+    return Decimal(str(usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def to_base_units(usd: Decimal, decimals: int) -> str:
+    """分位精度的美元金额 -> token 最小单位字符串。
+
+    Decimal 乘 10 的幂是精确的, 不需要 round() 兜底。
+    """
+    return str(int(usd * (10 ** decimals)))
 
 
 def compute_max_borrow(
@@ -305,10 +364,24 @@ class CapitalEfficiencyAgent(BaseAgent):
                 ),
             }
 
-        # 向下取整到分, 避免浮点精度导致链上金额与预期不符
-        borrow = int(borrow * 100) / 100
+        # 取整到分(用 Decimal 避免二进制浮点截断, 见 round_down_to_cent 注释)
+        borrow_dec = round_down_to_cent(borrow)
+
+        # 取整后必须仍为正数。min_borrow_usd 若配得比分位还小(如 0.005),
+        # 0.0099 会通过门槛检查却在取整后变成 0.00, 发出一笔借 0 的交易。
+        if borrow_dec <= 0:
+            return {
+                "metrics": metrics,
+                "actions": [],
+                "notes": (
+                    f"headroom {borrow:.6f} USD rounds down to zero at cent "
+                    f"precision -> skip (would broadcast a zero-value borrow)"
+                ),
+            }
+        borrow = float(borrow_dec)
+
         decimals = app_config.token_decimals(self.config.borrow_asset)
-        amount_base = str(int(round(borrow * (10 ** decimals))))
+        amount_base = to_base_units(borrow_dec, decimals)
 
         action = {
             "type": "REBALANCE",

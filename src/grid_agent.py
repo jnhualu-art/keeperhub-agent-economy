@@ -34,7 +34,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx
-from web3 import Web3
 
 from base_agent import (
     CATEGORY_GRID_TRADING,
@@ -49,6 +48,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 V3_POSITION_MANAGER = "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613"
+
+def _web3():
+    """惰性导入 web3。
+
+    web3 只用于 to_checksum_address(纯 RPC 路径), 但顶层 import 会让整个
+    模块在 web3 缺失或依赖链损坏时不可导入 —— 连 tick 对齐、网格报价这些
+    纯算术逻辑都测不了。宁可推迟到真正发起 RPC 时才报错。
+    """
+    try:
+        from web3 import Web3
+    except ImportError as exc:
+        raise RuntimeError(
+            "web3 不可用, 无法发起链上调用(报价计算本身不需要 web3)"
+        ) from exc
+    return Web3
+
 
 WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 USDT = "0x55d398326f99059fF775485246999027B3197955"
@@ -162,6 +177,37 @@ def tick_to_price(tick: int) -> float:
     return TICK_BASE ** tick
 
 
+# 偏斜最多只能吃掉半价差的这个比例。skew 的作用是把双边整体平移以实现均值
+# 回归, 但它绝不能大到让 ask 跌破 fair(或 bid 涨过 fair) —— 那等于主动
+# 贱卖/高价接盘, 是做市最不该犯的错。留 10% 保证双边永远不交叉。
+MAX_SKEW_OF_HALF_SPREAD = 0.9
+
+
+def clamp_skew(skew: float, half_spread: float) -> float:
+    """把库存偏斜限制在半价差之内, 保证 bid < fair < ask 恒成立。
+
+    skew 是相对量(如 0.075 表示平移 fair 的 7.5%), 被平均分配到双边
+    (各 skew/2)。只要 |skew/2| < half_spread, 双边就不可能交叉。
+    """
+    if half_spread <= 0:
+        return 0.0
+    limit = half_spread * MAX_SKEW_OF_HALF_SPREAD * 2
+    return max(-limit, min(limit, skew))
+
+
+def level_sizes(max_order_size: float, grid_levels: int) -> list[float]:
+    """把 max_order_size 按 1/lvl 权重分摊到各档, 保证单边合计恰好等于上限。
+
+    原实现 size = max_order_size / lvl, 三档合计 1.83 倍上限 —— 配置名叫
+    "max_order_size" 却约束不住, 实际敞口比配置值大近一倍。
+    """
+    if grid_levels <= 0 or max_order_size <= 0:
+        return []
+    weights = [1.0 / lvl for lvl in range(1, grid_levels + 1)]
+    total = sum(weights)
+    return [max_order_size * w / total for w in weights]
+
+
 def sqrt_price_x96_to_price(sqrt_price_x96: int, decimals0: int = 18, decimals1: int = 18) -> float:
     """
     Uniswap V3: price = (sqrtPriceX96 / 2^96)^2, 需按 decimals 差校正。
@@ -188,7 +234,7 @@ class GridTradingAgent(BaseAgent):
 
         self.pool_address = self._resolve_pool()
         self.pool = self.w3.eth.contract(
-            address=Web3.to_checksum_address(self.pool_address), abi=POOL_ABI
+            address=_web3().to_checksum_address(self.pool_address), abi=POOL_ABI
         )
 
         # 价格方向校正: V3 池子里 token0/token1 按地址字典序排列,
@@ -196,24 +242,24 @@ class GridTradingAgent(BaseAgent):
         # 必须取倒数, 否则价格会变成 1/691 这种量级, 背离检测直接爆表。
         self.pool_token0 = self.pool.functions.token0().call()
         self.pool_token1 = self.pool.functions.token1().call()
-        quote_cs = Web3.to_checksum_address(self.config.quote_token)
-        self._invert = quote_cs != Web3.to_checksum_address(self.pool_token1)
+        quote_cs = _web3().to_checksum_address(self.config.quote_token)
+        self._invert = quote_cs != _web3().to_checksum_address(self.pool_token1)
 
     def _resolve_pool(self) -> str:
         """解析池子地址: 优先用配置, 否则从 factory 动态查"""
         if self.config.pool_address:
-            return Web3.to_checksum_address(self.config.pool_address)
+            return _web3().to_checksum_address(self.config.pool_address)
 
         pm = self.w3.eth.contract(
-            address=Web3.to_checksum_address(V3_POSITION_MANAGER), abi=PM_ABI
+            address=_web3().to_checksum_address(V3_POSITION_MANAGER), abi=PM_ABI
         )
         factory_addr = pm.functions.factory().call()
         factory = self.w3.eth.contract(
-            address=Web3.to_checksum_address(factory_addr), abi=FACTORY_ABI
+            address=_web3().to_checksum_address(factory_addr), abi=FACTORY_ABI
         )
         pool = factory.functions.getPool(
-            Web3.to_checksum_address(self.config.token0),
-            Web3.to_checksum_address(self.config.token1),
+            _web3().to_checksum_address(self.config.token0),
+            _web3().to_checksum_address(self.config.token1),
             self.config.pool_fee,
         ).call()
 
@@ -221,7 +267,7 @@ class GridTradingAgent(BaseAgent):
             raise ValueError(
                 f"no pool for {self.config.token0}/{self.config.token1} fee={self.config.pool_fee}"
             )
-        return Web3.to_checksum_address(pool)
+        return _web3().to_checksum_address(pool)
 
     # ------------------------------------------------------------------
     # 数据层
@@ -345,34 +391,53 @@ class GridTradingAgent(BaseAgent):
         # ---- 4) 库存偏斜 (均值回归) ----
         total = self.config.current_inventory + self.config.current_cash
         inv_ratio = self.config.current_inventory / total if total else 0.5
-        skew = (self.config.target_ratio - inv_ratio) * self.config.skew_aggression
-        skew_bps = skew * 10_000
+        raw_skew = (self.config.target_ratio - inv_ratio) * self.config.skew_aggression
 
         # ---- 5) 生成双边网格报价 ----
         half_spread = spread_bps / 10_000 / 2
+
+        # 夹紧必须在知道 half_spread 之后: 库存偏斜不能大到把双边推过公允价。
+        skew = clamp_skew(raw_skew, half_spread)
+        skew_clamped = abs(skew - raw_skew) > 1e-12
+        skew_bps = skew * 10_000
+
         bid_center = fair * (1 - half_spread + skew / 2)
         ask_center = fair * (1 + half_spread + skew / 2)
 
+        # 库存超过硬顶时只挂卖单, 单边去库存。max_inventory 曾经是个死参数
+        # (定义了但从未被引用), 等于库存无上限。
+        over_inventory = self.config.current_inventory > self.config.max_inventory
+        if over_inventory:
+            sides = ("SELL",)
+        else:
+            sides = ("BUY", "SELL")
+
         orders = []
+        skipped_zero_price = 0
+        sizes = level_sizes(self.config.max_order_size, self.config.grid_levels)
         for lvl in range(1, self.config.grid_levels + 1):
             step = half_spread * lvl
-            size = self.config.max_order_size / lvl   # 越远层越小
-            orders.append(
-                {
-                    "side": "BUY",
-                    "level": lvl,
-                    "price": round(bid_center * (1 - step), 6),
-                    "size": round(size, 4),
-                }
-            )
-            orders.append(
-                {
-                    "side": "SELL",
-                    "level": lvl,
-                    "price": round(ask_center * (1 + step), 6),
-                    "size": round(size, 4),
-                }
-            )
+            size = sizes[lvl - 1]   # 越远层越小, 且单边合计恰为 max_order_size
+            for side in sides:
+                raw_price = (
+                    bid_center * (1 - step) if side == "BUY" else ask_center * (1 + step)
+                )
+                price = round(raw_price, 6)
+
+                # 小币(如 fair=4e-7)会被 round(x, 6) 压成 0.0, 而报价 0 意味着
+                # 「任何价格都接受」—— 挂上去就是白送。宁可不挂。
+                if price <= 0:
+                    skipped_zero_price += 1
+                    continue
+
+                orders.append(
+                    {
+                        "side": side,
+                        "level": lvl,
+                        "price": price,
+                        "size": round(size, 4),
+                    }
+                )
 
         # ---- 6) kill-switch 判定 ----
         if dislocation_bps > self.config.dislocation_threshold_bps * 5:
@@ -396,6 +461,11 @@ class GridTradingAgent(BaseAgent):
             "inventory_ratio": round(inv_ratio, 4),
             "target_ratio": self.config.target_ratio,
             "skew_bps": round(skew_bps, 2),
+            # 夹紧被触发说明库存失衡已超出价差能吸收的范围, 需要人工介入 ——
+            # 静默夹紧会掩盖真实风险, 所以显式上报。
+            "skew_clamped": skew_clamped,
+            "over_inventory": over_inventory,
+            "skipped_zero_price": skipped_zero_price,
             "bid": round(bid_center, 6),
             "ask": round(ask_center, 6),
             "pool": self.pool_address,

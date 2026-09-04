@@ -19,6 +19,7 @@ Yield Optimisation Agent
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -41,16 +42,58 @@ CACHE_PATH = os.path.join(
 CACHE_TTL_SEC = 300  # 全量约 12MB, 5 分钟缓存足够
 
 
+def stability_factor(apy: float, apy_mean_30d: float, decay: float = 1.0) -> float:
+    """APY 相对 30 日均值的可信度, 落在 (0, 1]。
+
+    用 exp(-decay × deviation) 而不是 max(0.3, 1 - deviation): 后者给偏离
+    20 倍的刷量池仍留 0.3 分, 于是 APY 200%(30日均值 10%) 的池子能拿
+    200 × 0.3 = 60 分, 击败 APY 15% 的稳定池(15 分) —— 惩罚形同虚设。
+
+    指数衰减下同样的例子得分是 200 × e^-19 ≈ 0, 且对偏离单调, 即使所有
+    候选都很不稳定, argmax 仍会挑出最不差的那个。
+    """
+    if apy_mean_30d <= 0:
+        return 1.0
+    deviation = abs(apy - apy_mean_30d) / apy_mean_30d
+    return math.exp(-decay * deviation)
+
+
+def liquidity_factor(
+    tvl: float, min_tvl: float, saturation_mult: float = 100.0
+) -> float:
+    """TVL 的流动性评分, 落在 [0, 1]。
+
+    原写法 min(1.0, tvl / min_tvl) 恒等于 1.0: 因为 filter_pools 已经把
+    tvl < min_tvl 的池子全过滤掉了, 剩下的必然有 tvl/min_tvl >= 1。于是
+    号称「APY × 稳定性 × 流动性」的三因子模型实际只剩两个因子在起作用。
+
+    把「资格门槛」(min_tvl, 硬过滤) 和「评分基准」(饱和点) 分开: 刚过线
+    的池子得 0 分附近, 达到 min_tvl × saturation_mult 才拿满分。对数而非
+    线性, 因为流动性的边际收益递减。
+    """
+    if tvl <= 0 or min_tvl <= 0:
+        return 0.0
+    # 饱和点必须严格大于门槛, 否则分母为 0 或负, 因子失去意义
+    span = math.log(max(saturation_mult, 1.0001))
+    raw = math.log(max(tvl / min_tvl, 1.0)) / span
+    return max(0.0, min(1.0, raw))
+
+
 @dataclass
 class YieldConfig(AgentConfig):
     """Yield agent 专属参数"""
 
-    min_tvl_usd: float = 1_000_000.0     # 流动性下限
+    min_tvl_usd: float = 1_000_000.0     # 流动性下限(硬过滤: 低于此不参与)
     min_apy_pct: float = 0.5             # 低于此不值得
     max_apy_pct: float = 200.0           # 高于此视为噪音/风险
     rebalance_threshold: float = 0.15    # 相对提升 15% 才迁移
     top_n: int = 5                       # 输出前 N 个候选
     current_pool_id: str = ""            # 当前持仓池(空=空仓)
+    # 流动性因子的饱和点 = min_tvl_usd × 该倍数。必须显著大于 1: 否则刚过
+    # 硬过滤线的池子就能拿满分, 因子恒为 1.0 形同虚设(见 liquidity_factor)。
+    liquidity_saturation_mult: float = 100.0
+    # 稳定性衰减系数: APY 相对 30 日均值的偏离按 exp(-k × deviation) 惩罚。
+    stability_decay: float = 1.0
 
 
 class YieldOptimisationAgent(BaseAgent):
@@ -129,13 +172,16 @@ class YieldOptimisationAgent(BaseAgent):
         tvl = pool.get("tvlUsd") or 0.0
 
         # 1) 稳定性: 当前 APY 偏离 30 日均值越多, 越不可信
-        stability = 1.0
-        if apy30 > 0:
-            deviation = abs(apy - apy30) / apy30
-            stability = max(0.3, 1.0 - deviation)
+        stability = stability_factor(
+            apy, apy30, decay=self.config.stability_decay
+        )
 
-        # 2) 流动性: 低于目标 TVL 线性衰减
-        liquidity = min(1.0, tvl / self.config.min_tvl_usd) if tvl else 0.0
+        # 2) 流动性: 相对硬过滤下限的对数增长, 到饱和点拿满分
+        liquidity = liquidity_factor(
+            tvl,
+            min_tvl=self.config.min_tvl_usd,
+            saturation_mult=self.config.liquidity_saturation_mult,
+        )
 
         score = apy * stability * liquidity
         detail = {
@@ -182,7 +228,21 @@ class YieldOptimisationAgent(BaseAgent):
         current_id = self.config.current_pool_id
         current = next((s for s in scored if s["pool_id"] == current_id), None)
 
-        if not current_id:
+        # 持仓池没出现在候选里有两种可能, 必须区分:
+        #   (a) 空仓 —— 正常, 应当建仓
+        #   (b) 有持仓但该池没通过过滤 —— 风险信号, 原实现会走进下面的 else
+        #       分支报 "already in best pool -> hold", 把「持仓已经不合格」
+        #       粉饰成「持仓就是最优」。这正是监控型 agent 最不该犯的错。
+        current_ineligible = bool(current_id) and current is None
+
+        if current_ineligible:
+            notes = (
+                f"HOLDING AT RISK: current pool {current_id} did not pass "
+                f"filters (TVL < {self.config.min_tvl_usd:,.0f} or APY outside "
+                f"[{self.config.min_apy_pct}, {self.config.max_apy_pct}]) -> "
+                f"manual review needed; not claiming it is the best pool"
+            )
+        elif not current_id:
             notes = "no current position -> recommend entering best pool"
             actions.append(
                 {
