@@ -239,3 +239,6 @@ print("=" * 78)
 hits = [r for r in results if r[0]]
 print(f"命中 {len(hits)} / {len(results)}")
 print("=" * 78)
+
+# 退出码非零表示有命中 —— CI 可以直接把这个脚本当门禁跑, 不必解析它的输出。
+sys.exit(1 if hits else 0)

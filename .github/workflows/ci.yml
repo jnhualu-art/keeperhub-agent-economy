@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 漏洞库持续更新, 每周重跑一次才能发现"上周还干净、这周中招"的包
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+  # 这三个脚本是本项目安全审计的实证载体: 每一条探针都对应一个真实存在过
+  # 并已修复的缺陷, 有命中时以非零退出码结束。它们同时也是回归门禁 ——
+  # 谁把修复改回去, CI 立刻变红。
+  audit-probes:
+    name: Security audit probes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executor threat model
+        run: python scripts/audit_probe.py
+
+      - name: Decision agent threat model
+        run: python scripts/audit_agents.py
+
+      - name: Indexer threat model
+        run: python scripts/audit_erc8004.py
+
+  # 依赖漏洞扫描。
+  #
+  # 两点刻意的设计:
+  #   1) 扫 requirements.txt 的依赖树, 而不是整个环境 —— 后者会把 runner
+  #      自带及无关的包算进来, 报出一堆与本项目无关的问题, 最后没人看。
+  #   2) 先跑阳性对照再扫真依赖。pip-audit 报"0 漏洞"有两种可能: 真干净,
+  #      或者它根本没正常工作。后者比不扫更糟, 因为它制造安全感。
+  deps:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Positive control (scanner must actually detect a known-vulnerable pin)
+        run: |
+          # 固定一个已知带 CVE 的版本。若这一条没被发现, 说明扫描器坏了,
+          # 后面那份干净的报告就不可信。
+          printf 'aiohttp==3.14.1\n' > /tmp/positive-control.txt
+          if pip-audit -r /tmp/positive-control.txt > /tmp/pc.log 2>&1; then
+            echo "::error::阳性对照未检出漏洞 —— 扫描器可能失效, 下方结论不可信"
+            cat /tmp/pc.log
+            exit 1
+          fi
+          echo "阳性对照通过: 已检出已知漏洞"
+          grep -c "aiohttp" /tmp/pc.log || true
+
+      - name: Audit project dependencies
+        run: pip-audit -r requirements.txt
+
+      - name: Audit project dependencies (strict, ignoring unfixed findings)
+        continue-on-error: true
+        run: |
+          # 有些漏洞上游尚未发布修复版本, 此时 pip-audit 会以非零码退出。
+          # 这一条只作提示, 不阻断 —— 已知但无法修 与 未知 是两回事。
+          pip-audit -r requirements.txt --strict --desc || true

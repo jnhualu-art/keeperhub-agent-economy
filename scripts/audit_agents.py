@@ -653,3 +653,6 @@ if not USING_REAL_WEB3:
     print("注: 本机 web3 依赖链不完整, 但已不影响本审计 —— 两个 agent 已改为")
     print("    惰性导入 web3, 被测的纯算术路径不需要它。仅 RPC 路径不可用。")
 print("=" * 78)
+
+# 退出码非零表示有命中 —— CI 可以直接把这个脚本当门禁跑, 不必解析它的输出。
+sys.exit(1 if hits else 0)

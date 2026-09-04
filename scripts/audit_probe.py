@@ -238,3 +238,6 @@ for name, hit, evidence in results:
 print("\n" + "=" * 74)
 n_hit = sum(1 for _, h, _ in results if h)
 print(f"命中 {n_hit}/{len(results)} 项")
+
+# 退出码非零表示有命中 —— CI 可以直接把这个脚本当门禁跑, 不必解析它的输出。
+sys.exit(1 if n_hit else 0)
